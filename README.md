@@ -1,16 +1,12 @@
-## Hi there 👋
+Commit changes
+Commit message
+Revise README with personal and project details
+Copilot commit message generated: Revise README with personal and project details
+Extended description
+Updated README to reflect personal branding, tech stack, selected projects, and current interests.
+Message and description suggested by Copilot.
+Direct commit or PR
 
-<!--
-**nikalab7/nikalab7** is a ✨ _special_ ✨ repository because its `README.md` (this file) appears on your GitHub profile.
+Commit directly to the main branch
 
-Here are some ideas to get you started:
-
-- 🔭 I’m currently working on ...
-- 🌱 I’m currently learning ...
-- 👯 I’m looking to collaborate on ...
-- 🤔 I’m looking for help with ...
-- 💬 Ask me about ...
-- 📫 How to reach me: ...
-- 😄 Pronouns: ...
-- ⚡ Fun fact: ...
--->
+Create a new branch for this commit and start a pull request Learn more about pull requests
