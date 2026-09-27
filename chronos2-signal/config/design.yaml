@@ -1,0 +1,140 @@
+# Chronos-2 hourly stock signal system — registered design configuration.
+#
+# This file is the machine-readable form of the protocol document
+# (docs/DESIGN.md, section 19). Values are engineering starting assumptions,
+# not empirically optimal settings and not measured performance.
+#
+# Values remain unchanged until a registered protocol amendment. Any change
+# must bump `design_version` and be recorded in docs/AMENDMENTS.md.
+
+design_version: chronos2_hourly_v1
+status: design_only_unvalidated
+
+data:
+  provider: yahoo_via_yfinance
+  hourly_interval: 1h
+  hourly_request_lookback_days: 729
+  daily_request_years: 8
+  archive_interval: 15m
+  archive_initial_lookback_days: 59
+  prepost: false
+  auto_adjust: false
+  actions: true
+  automatic_repair: false
+  snapshot_policy: immutable_with_provenance
+  exchange_timezone: America/New_York
+  storage_timezone: UTC
+  max_parallel_requests: 2
+  max_retries: 3
+
+universe:
+  max_issuers: 50
+  max_issuers_per_sector: 10
+  candidate_manifest_required: true
+  min_asof_price_usd: 10
+  min_median_daily_dollar_volume_usd: 50000000
+  liquidity_window_sessions: 20
+  min_daily_observations: 200
+  common_hourly_history_bars: 512
+  min_observed_fraction: 0.99
+  latest_session_complete_required: true
+
+model:
+  id: amazon/chronos-2
+  revision: 95a9710e2596287d08352589f42634fa5abdf0a7
+  context_length: 256
+  context_candidates: [128, 256, 512]
+  horizon_sessions: 2
+  prediction_length_policy: bars_in_next_two_exchange_sessions
+  quantile_levels: [0.10, 0.25, 0.50, 0.75, 0.90]
+  target: origin_rebased_log_split_consistent_close_times_100
+  cross_learning: false
+  batch_size_channels: 128
+  dtype: float32
+  finetune: false
+  future_inputs: calendar_only
+  # Provenance recorded in the protocol document; verified at download time,
+  # never assumed. See src/chronos2_signal/forecaster.py.
+  safetensors_sha256: ddcda3c7508bf2528087723e98a20707cc04b7f370ae275a9fd88078ddba4f42
+
+decision:
+  return_estimator: ridge
+  ridge_alpha: 10
+  probability_estimator: logistic_regression
+  logistic_C: 1.0
+  logistic_max_iter: 2000
+  calibration: sigmoid_on_later_disjoint_dates
+  date_total_sample_weight: 1.0
+  standardized_feature_clip_abs: 8.0
+  min_probability: 0.60
+  min_estimated_net_return: 0.003
+  require_positive_stress_estimate: true
+  ranking: estimated_net_return_over_sigma_2d
+  sigma_2d_floor: 0.005
+  sigma_daily_window_sessions: 20
+
+execution:
+  signal_time: exchange_close_plus_30_minutes
+  max_data_delay_after_close_minutes: 120
+  entry: next_session_official_open_reference
+  exit: second_session_official_close_reference
+  base_slippage_bps_per_side: 10
+  stress_slippage_bps_per_side: 25
+  severe_slippage_bps_per_side: 50
+  explicit_broker_fees: separately_accounted
+  explicit_fee_fraction: 0.0
+  gap_filter: disabled
+  stop_loss: disabled
+  take_profit: disabled
+  automatic_orders: false
+
+portfolio:
+  max_new_alerts_per_origin: 2
+  max_open_positions: 3
+  max_open_per_sector: 1
+  pairwise_correlation_cap: 0.80
+  correlation_window_sessions: 60
+  position_fraction_current_equity_at_entry: 0.10
+  max_gross_exposure: 0.30
+  pause_new_alerts_at_portfolio_drawdown: 0.05
+  initial_equity: 100000.0
+
+validation:
+  earliest_primary_origin: 2025-10-31
+  final_historical_test_origin_sessions: 60
+  min_fit_origin_sessions: 80
+  calibration_origin_sessions: 30
+  validation_origin_sessions: 20
+  purge_sessions_per_boundary: 2
+  require_label_available_timestamp_check: true
+  decision_refit_every_sessions: 20
+  initial_learned_variants: [B0, C128, C256, C512, U256]
+  bootstrap_samples: 2000
+  bootstrap_block_sessions: 10
+  bootstrap_block_sensitivity: [5, 20]
+  forward_min_sessions: 60
+  forward_min_executed_signals: 50
+  combined_evaluation_min_executed_signals: 100
+  combined_evaluation_min_signal_sessions: 60
+  # Development selection floors (section 12).
+  development_min_executed_trades: 40
+  development_min_signal_sessions: 25
+  development_selection_bootstrap_confidence: 0.90
+  promotion_bootstrap_confidence: 0.95
+  promotion_min_profitable_blocks: 3
+  promotion_block_sessions: 20
+
+events:
+  version1_mode: annotations_only
+  future_event_veto_requires_new_version: true
+  missing_event_status: unknown
+
+runtime:
+  numerical_store: parquet
+  ledger: sqlite
+  device: available_gpu_else_cpu
+  external_paid_services_required: false
+  exact_dependency_lock_required_before_run: true
+  schema_version: 1
+  exchange_calendar: XNYS
+  market_proxy: SPY

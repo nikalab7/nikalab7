@@ -1,0 +1,15 @@
+# Example candidate roster. This is a TEMPLATE, not a screened watchlist.
+#
+# Replace every row with a roster chosen independently of this experiment's
+# returns (for example a published large-cap index constituent list captured at
+# a recorded date), then run:
+#
+#     chronos2-signal audit --roster config/candidate_roster.csv
+#
+# The audit measures trailing dollar volume and eligibility; select_watchlist
+# then freezes the top issuers per the registered rule. One share class per
+# issuer. ETFs belong in sector_etf, never in the symbol column.
+symbol,issuer_id,exchange,sector,sector_etf,share_class,security_type,listing_history,notes
+EXAMPLE1,PLACEHOLDER-0001,XNYS,example_sector_a,XLA,common,common_stock,,replace before use
+EXAMPLE2,PLACEHOLDER-0002,XNAS,example_sector_b,XLB,common,common_stock,,replace before use
+EXAMPLE3,PLACEHOLDER-0003,XNYS,example_sector_c,XLC,common,common_stock,,replace before use

@@ -1,0 +1,13 @@
+# Core research environment, pinned to the versions the invariant suite
+# was actually executed against. Regenerate with:
+#   python -m pip freeze
+# The provider and model extras are intentionally NOT pinned here; they
+# are locked at build-order step 2 (data audit), before any result is
+# examined. See docs/ENVIRONMENT.md.
+numpy==2.4.6
+pandas==3.0.6
+scikit-learn==1.9.1
+pandas-market-calendars==5.4.0
+pyarrow==25.0.1
+PyYAML==6.0.1
+pytest==9.1.1

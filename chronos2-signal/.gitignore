@@ -1,0 +1,20 @@
+# Research artifacts. Snapshots, ledgers and reports are reproducible from the
+# registered configuration plus the provider, and a committed ledger would make
+# the repository the source of truth for data it does not own.
+artifacts/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.parquet
+
+# The frozen watchlist is created by the data audit, not committed as a guess.
+config/candidate_roster.csv
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+.venv/
