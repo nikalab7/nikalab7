@@ -28,7 +28,10 @@ compatibility problem the protocol requires resolving before any run.
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
 import datetime as dt
+import importlib.metadata as importlib_metadata
 import inspect
 from dataclasses import dataclass, field
 from enum import Enum
@@ -259,6 +262,41 @@ class Forecaster(Protocol):
     def provenance(self) -> dict[str, Any]:  # pragma: no cover
         ...
 
+    def cache_identity(self) -> dict[str, Any]:  # pragma: no cover
+        """Everything about the forecaster that can change its numbers.
+
+        Excludes the batch budget and the device on purpose: neither may change
+        a prediction beyond numerical tolerance, and a cache key that included
+        them would hide a violation of that rule instead of exposing it.
+        """
+        ...
+
+
+#: Version of the mapping from a task to the library's input dictionary. Part
+#: of the cache identity, so forecasts produced under an earlier mapping are
+#: never served as if they came from the current one.
+CHRONOS_INPUT_SCHEMA = 2
+
+
+def _inference_context() -> Any:
+    """``torch.inference_mode()`` when torch is present, else a no-op.
+
+    The real pipeline needs torch anyway; the fallback only exists so that the
+    adapter's own logic can be tested against a fake pipeline without it.
+    """
+    try:
+        import torch
+    except ImportError:
+        return contextlib.nullcontext()
+    return torch.inference_mode()
+
+
+def _package_version(name: str) -> str:
+    try:
+        return importlib_metadata.version(name)
+    except importlib_metadata.PackageNotFoundError:
+        return "absent"
+
 
 @dataclass
 class Chronos2Forecaster:
@@ -396,11 +434,9 @@ class Chronos2Forecaster:
 
     def predict(self, tasks: Sequence[ChronosTask]) -> list[ForecastResult]:
         self.load()
-        import torch
-
         results: list[ForecastResult] = []
         for batch in batch_tasks_by_channels(tasks, self.batch_size_channels):
-            with torch.inference_mode():
+            with _inference_context():
                 results.extend(self._predict_batch(batch))
         return results
 
@@ -439,16 +475,30 @@ class Chronos2Forecaster:
                 for task in batch
             ]
 
-        arrays = self._to_arrays(raw, len(batch))
+        per_task = self._to_arrays(raw, len(batch))
         results: list[ForecastResult] = []
-        for task, array in zip(batch, arrays, strict=True):
+        for task, array in zip(batch, per_task, strict=True):
             terminal = _terminal_indices(task)
+            oriented, problem = _orient_levels_by_horizon(array, len(self.quantile_levels))
+            if problem is not None:
+                results.append(
+                    ForecastResult(
+                        symbol=task.symbol,
+                        origin_session=task.origin_session,
+                        quantile_levels=self.quantile_levels,
+                        paths=np.asarray(array, dtype=float),
+                        terminal_indices=terminal,
+                        status=ForecastStatus.BLOCKED_SHAPE,
+                        detail=problem,
+                    )
+                )
+                continue
             results.append(
                 validate_quantile_paths(
                     task.symbol,
                     task.origin_session,
                     self.quantile_levels,
-                    array,
+                    oriented,
                     prediction_length,
                     terminal,
                 )
@@ -461,50 +511,122 @@ class Chronos2Forecaster:
         Kept deliberately small and in one place: it is the single point that
         depends on the library's input contract, and the compatibility smoke
         test exercises exactly this mapping.
+
+        **Unverified against the installed package** -- the model cannot be
+        downloaded in the environment this was written in. The mapping follows
+        the documented pattern as understood: a covariate known in the future
+        appears under the *same name* in ``past_covariates`` (its history) and in
+        ``future_covariates`` (its values over the horizon); a covariate only in
+        ``past_covariates`` is past-only. :meth:`channel_usage_check` exists to
+        confirm, on the real checkpoint, that every channel actually reaches the
+        model rather than being silently dropped.
         """
-        past_covariates = task.past_covariates()
-        past_calendar = task.past_calendar
-        payload: dict[str, Any] = {
-            "target": np.asarray(task.target, dtype=np.float32),
-        }
-        covariate_names = list(task.channel_names[1:])
-        if past_covariates.shape[1]:
-            payload["past_covariates"] = {
-                name: np.asarray(past_covariates[:, column], dtype=np.float32)
-                for column, name in enumerate(covariate_names)
-            }
         from .calendar_spec import CALENDAR_CHANNEL_NAMES
 
-        payload["future_covariates"] = {
-            name: np.asarray(task.future_calendar[:, column], dtype=np.float32)
-            for column, name in enumerate(CALENDAR_CHANNEL_NAMES)
+        past: dict[str, np.ndarray] = {}
+        for column, name in enumerate(task.channel_names[1:]):
+            past[name] = np.asarray(task.past_covariates()[:, column], dtype=np.float32)
+        for column, name in enumerate(CALENDAR_CHANNEL_NAMES):
+            past[name] = np.asarray(task.past_calendar[:, column], dtype=np.float32)
+        return {
+            "target": np.asarray(task.target, dtype=np.float32),
+            "past_covariates": past,
+            "future_covariates": {
+                name: np.asarray(task.future_calendar[:, column], dtype=np.float32)
+                for column, name in enumerate(CALENDAR_CHANNEL_NAMES)
+            },
         }
-        payload["past_known_covariates"] = {
-            name: np.asarray(past_calendar[:, column], dtype=np.float32)
-            for column, name in enumerate(CALENDAR_CHANNEL_NAMES)
-        }
-        return payload
 
     @staticmethod
     def _to_arrays(raw: Any, expected: int) -> list[np.ndarray]:
-        """Normalise the library's return value into one array per task."""
+        """Split the library's return value into one array per task.
+
+        ``predict_quantiles`` returns ``(quantiles, mean)``. The mean is the
+        library's point forecast, which is the median and is not used here.
+        Unpacking that pair explicitly matters: treating it as a generic
+        sequence would read a two-task batch as "task one = quantiles, task two
+        = mean", silently.
+        """
+        if isinstance(raw, tuple) and len(raw) == 2:
+            raw = raw[0]
         if hasattr(raw, "detach"):
             raw = raw.detach().cpu().numpy()
-        array = np.asarray(raw)
-        if array.ndim == 3:
-            # (batch, quantiles, horizon) or (batch, horizon, quantiles)
-            if array.shape[0] != expected:
+        if isinstance(raw, (list, tuple)):
+            items = [
+                item.detach().cpu().numpy() if hasattr(item, "detach") else np.asarray(item)
+                for item in raw
+            ]
+            if len(items) != expected:
                 raise ForecastError(
-                    f"pipeline returned batch dimension {array.shape[0]} for {expected} tasks"
+                    f"pipeline returned {len(items)} per-task outputs for {expected} tasks"
                 )
+            return items
+        array = np.asarray(raw)
+        if array.ndim >= 3 and array.shape[0] == expected:
             return [np.asarray(item) for item in array]
         if array.ndim == 2 and expected == 1:
             return [array]
-        if isinstance(raw, (list, tuple)) and len(raw) == expected:
-            return [np.asarray(item) for item in raw]
         raise ForecastError(
             f"cannot interpret pipeline output of shape {array.shape} for {expected} tasks"
         )
+
+    def cache_identity(self) -> dict[str, Any]:
+        return {
+            "forecaster": "chronos2",
+            "model_id": self.model_id,
+            "revision": self.revision,
+            "quantile_levels": list(self.quantile_levels),
+            "cross_learning": self.cross_learning,
+            "dtype": self.dtype,
+            "package_version": _package_version("chronos-forecasting"),
+            "input_schema": CHRONOS_INPUT_SCHEMA,
+        }
+
+    def channel_usage_check(
+        self, task: ChronosTask, *, tolerance: float = 1e-7
+    ) -> dict[str, Any]:
+        """Confirm on the real checkpoint that each channel group reaches the model.
+
+        Each group is perturbed in isolation -- the weekday channels of the
+        calendar history, the same channels over the horizon, and the past-only
+        covariates -- and the forecast is compared with the unperturbed one. A
+        group whose perturbation leaves the output unchanged is not being
+        consumed, which is how a wrong input mapping shows up: not as an error,
+        but as a model quietly forecasting from less than it was given.
+
+        This is a compatibility check with no performance meaning, and it must
+        not be used to tune anything.
+        """
+        baseline = self.predict([task])[0]
+        report: dict[str, Any] = {"baseline_status": baseline.status.value}
+        if not baseline.usable:
+            report["detail"] = baseline.detail
+            return report
+
+        def changed(candidate: ChronosTask) -> bool:
+            result = self.predict([candidate])[0]
+            if not result.usable or result.paths.shape != baseline.paths.shape:
+                return True
+            return not np.allclose(result.paths, baseline.paths, rtol=0.0, atol=tolerance)
+
+        past_calendar = task.past_calendar.copy()
+        past_calendar[:, 3:] = -past_calendar[:, 3:]
+        report["past_calendar_used"] = changed(
+            dataclasses.replace(task, past_calendar=past_calendar)
+        )
+
+        future_calendar = task.future_calendar.copy()
+        future_calendar[:, 3:] = -future_calendar[:, 3:]
+        report["future_calendar_used"] = changed(
+            dataclasses.replace(task, future_calendar=future_calendar)
+        )
+
+        if task.past.shape[1] > 1:
+            past = task.past.copy()
+            finite = np.isfinite(past[:, 1:])
+            past[:, 1:] = np.where(finite, -past[:, 1:], past[:, 1:])
+            report["past_covariates_used"] = changed(dataclasses.replace(task, past=past))
+        return report
 
     def provenance(self) -> dict[str, Any]:
         return {
@@ -606,6 +728,43 @@ class DeterministicStubForecaster:
             "momentum_bars": self.momentum_bars,
             "band_scale": self.band_scale,
         }
+
+    def cache_identity(self) -> dict[str, Any]:
+        return {
+            "forecaster": "deterministic_stub",
+            "quantile_levels": list(self.quantile_levels),
+            "momentum_bars": self.momentum_bars,
+            "band_scale": self.band_scale,
+        }
+
+
+def _orient_levels_by_horizon(
+    array: Any, n_levels: int
+) -> tuple[np.ndarray, str | None]:
+    """Bring one task's output into ``(levels, horizon)`` order.
+
+    Libraries differ on whether the quantile axis comes first or last, and may
+    add a leading axis for the number of target series. The orientation is
+    decided from the known number of requested levels rather than assumed.
+    When both axes have that length the orientation cannot be decided, and the
+    forecast is blocked rather than guessed.
+    """
+    oriented = np.asarray(array, dtype=float)
+    while oriented.ndim > 2 and oriented.shape[0] == 1:
+        oriented = oriented[0]
+    if oriented.ndim != 2:
+        return oriented, None  # validate_quantile_paths reports the shape
+    rows, columns = oriented.shape
+    if rows == n_levels and columns != n_levels:
+        return oriented, None
+    if columns == n_levels and rows != n_levels:
+        return oriented.T, None
+    if rows == columns == n_levels:
+        return oriented, (
+            f"output is {rows}x{columns} with {n_levels} requested levels: the "
+            "quantile axis cannot be told apart from the horizon axis"
+        )
+    return oriented, None
 
 
 def _terminal_indices(task: ChronosTask) -> tuple[int, ...]:

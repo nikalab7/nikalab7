@@ -17,7 +17,10 @@ The rules are the registered ones and nothing else:
 
 Prices are split-consistent. A position's economic size is therefore unchanged
 by a split, and the nominal share count is tracked alongside purely so the
-ledger reconciles against a brokerage view.
+ledger reconciles against a brokerage view. Every price supplied for one
+position must be in the units it was entered in; when the data's units change
+mid-hold, the session engine re-expresses the position first
+(:meth:`ReferencePortfolio.restate_units`).
 """
 
 from __future__ import annotations
@@ -50,6 +53,11 @@ class PaperPosition:
     ``restated_shares`` is the quantity in split-consistent units and is
     constant across the hold. ``nominal_shares`` is what a statement would
     show, and changes by exactly the split ratio.
+
+    ``unit_restatement`` is the factor by which the position has been
+    re-expressed because later quotes arrived in different units than its
+    entry (see :meth:`ReferencePortfolio.restate_units`). It is 1.0 whenever
+    the data kept one set of units across the hold.
     """
 
     position_id: str
@@ -72,6 +80,7 @@ class PaperPosition:
     proceeds: float | None = None
     cash_dividends: float = 0.0
     share_adjustment: float = 1.0
+    unit_restatement: float = 1.0
     max_adverse_excursion: float | None = None
     status: str = "open"
 
@@ -335,6 +344,26 @@ class ReferencePortfolio:
                     continue
                 position.nominal_shares *= split.value
                 position.share_adjustment *= split.value
+
+    def restate_units(self, position: PaperPosition, factor: float) -> None:
+        """Re-express an open position in price units ``factor`` times smaller.
+
+        Needed when later quotes arrive in different units than the entry: a
+        point-in-time view after an ex-date quotes post-split prices, while the
+        entry was filled from pre-split ones. The quantity grows by exactly the
+        factor and every recorded price shrinks by it, so the cost basis, the
+        market value and the realised return are unchanged -- a change of units
+        creates no wealth. The nominal count is not touched here; the split
+        itself is booked by :meth:`apply_splits`.
+        """
+        if not math.isfinite(factor) or factor <= 0.0:
+            raise PortfolioError(f"{position.symbol}: invalid unit factor {factor!r}")
+        if position not in self.positions:
+            raise PortfolioError(f"{position.symbol}: only an open position can be restated")
+        position.restated_shares *= factor
+        position.entry_reference_price /= factor
+        position.entry_fill_price /= factor
+        position.unit_restatement *= factor
 
     def record_excursion(self, lows: Mapping[str, float]) -> None:
         """Track the worst drawdown from entry, for diagnosis only.

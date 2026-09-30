@@ -46,7 +46,9 @@ from chronos2_signal.holdout import AccessMode, HoldoutViolation
 from chronos2_signal.market import BarPanel
 from chronos2_signal.notifier import Notifier, RecordingChannel
 from chronos2_signal.policy import OpenPositionView, PolicyEngine
-from chronos2_signal.pipeline import FixtureMarketSource, ResearchPipeline, WalkForwardRunner
+from chronos2_signal.pipeline import ResearchPipeline
+from chronos2_signal.simulation import WalkForwardRunner
+from chronos2_signal.sources import FixtureMarketSource
 from chronos2_signal.portfolio import EntryRequest, ReferencePortfolio
 from chronos2_signal.protocol import ProtocolError, build_schedule, label_available_at
 from chronos2_signal.storage import Ledger, SnapshotStore, StorageError
@@ -1201,7 +1203,8 @@ def test_invariant_12_baselines_share_dates_fills_costs_and_capital(
     # Controls are constructed on that same index, and idle cash earns zero for
     # every system alike.
     sessions = candidate.daily.sessions
-    spy = pipeline.source.daily_panel("SPY")
+    # One view at the last session: one consistently restated series.
+    spy = pipeline.source.view(sessions[-1]).daily_panel("SPY")
     market_returns, previous = [], None
     for session in sessions:
         close = float(spy.row(session)["close"])
@@ -1226,7 +1229,7 @@ def test_invariant_12_baselines_share_dates_fills_costs_and_capital(
         block_sessions=config.validation.bootstrap_block_sessions,
         samples=200,
         confidence=0.9,
-        reference=momentum.daily.name,
+        differences=[(candidate.daily.name, momentum.daily.name)],
     )
     assert f"{candidate.daily.name}_minus_{momentum.daily.name}" in estimates
     from chronos2_signal.evaluation import DailySeries

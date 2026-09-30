@@ -127,6 +127,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=200,
         help="reduced sample count so the demo stays quick",
     )
+    demo.add_argument(
+        "--folds",
+        default="0",
+        help="comma-separated development folds to run, or 'all' (default: 0)",
+    )
     return parser
 
 
@@ -491,6 +496,14 @@ def _smoke(args: argparse.Namespace, config) -> int:
     started = time.perf_counter()
     result = forecaster.predict([task])[0]
     elapsed = time.perf_counter() - started
+    # The input mapping is the one part of the adapter that could not be checked
+    # without the checkpoint. A channel that does not change the output is not
+    # reaching the model, and the smoke test fails rather than passing quietly.
+    usage = forecaster.channel_usage_check(task)
+    channels_ok = all(
+        usage.get(name) is True
+        for name in ("past_calendar_used", "future_calendar_used", "past_covariates_used")
+    )
 
     payload = {
         "status": result.status.value,
@@ -505,6 +518,8 @@ def _smoke(args: argparse.Namespace, config) -> int:
         "terminal_indices": list(result.terminal_indices),
         "horizon_sessions": [bar.session.isoformat() for bar in task.horizon_bars],
         "diagnostics": dict(result.diagnostics),
+        "channel_usage": usage,
+        "channels_reach_model": channels_ok,
         "measured_seconds_single_task": round(elapsed, 3),
         "notes": [
             "Synthetic input: this measures compatibility, shapes and runtime only.",
@@ -512,7 +527,7 @@ def _smoke(args: argparse.Namespace, config) -> int:
         ],
     }
     _emit(payload, as_json=args.json)
-    return 0 if result.usable else 1
+    return 0 if result.usable and channels_ok else 1
 
 
 def _demo_study(args: argparse.Namespace, config) -> int:
@@ -527,8 +542,9 @@ def _demo_study(args: argparse.Namespace, config) -> int:
     from .fixtures import SyntheticSpec, SyntheticMarket
     from .forecaster import DeterministicStubForecaster
     from .operations import render_markdown, run_study
-    from .pipeline import FixtureMarketSource, ResearchPipeline
+    from .pipeline import ResearchPipeline
     from .protocol import build_schedule
+    from .sources import FixtureMarketSource
     from .universe import Candidate, CandidateRoster, select_watchlist
 
     calendar = ExchangeCalendar(config.runtime.exchange_calendar)
@@ -603,13 +619,18 @@ def _demo_study(args: argparse.Namespace, config) -> int:
     if not schedule.folds:
         print("no folds available for the demo window", file=sys.stderr)
         return 1
+    try:
+        folds = _parse_folds(args.folds, len(schedule.folds))
+    except ValueError as exc:
+        print(f"invalid --folds: {exc}", file=sys.stderr)
+        return 2
 
     study = run_study(
         pipeline=pipeline,
         schedule=schedule,
         variant=args.variant,
         checkpoint="offline-demo",
-        fold_index=0,
+        folds=folds,
         bootstrap_samples=args.bootstrap_samples,
         notes=(
             "SYNTHETIC DATA. Seeded random walk, arithmetic forecaster fixture, "
@@ -635,6 +656,19 @@ def _demo_study(args: argparse.Namespace, config) -> int:
         print(markdown)
         print(f"artifacts: {json_path}, {markdown_path}")
     return 0
+
+
+def _parse_folds(text: str, available: int) -> tuple[int, ...]:
+    """``"all"`` or a comma-separated list of fold indices."""
+    if text.strip().lower() == "all":
+        return tuple(range(available))
+    folds = tuple(int(part) for part in text.split(",") if part.strip())
+    if not folds:
+        raise ValueError("no fold given")
+    for fold in folds:
+        if not 0 <= fold < available:
+            raise ValueError(f"fold {fold} outside the {available} available")
+    return folds
 
 
 if __name__ == "__main__":  # pragma: no cover

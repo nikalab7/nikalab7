@@ -72,13 +72,20 @@ own report says that its numbers describe a seeded random walk.
 pytest -q
 ```
 
-57 tests, fully offline. The twelve integrity invariants of the protocol's section 16
+90 tests, fully offline. The twelve integrity invariants of the protocol's section 16
 are in `tests/test_invariants.py` and are mapped to what they protect in
 [`docs/INVARIANTS.md`](docs/INVARIANTS.md). Among other things they prove that
 appending future prices cannot change an earlier origin's features, that a split
 creates no wealth, that the overnight gap contributes no captured return, that
 reordering forecast tasks does not change a prediction, and that the candidate and its
 baselines share one date index, one set of fills and one cost model.
+
+`tests/test_system.py` checks the same guarantees **through the pipeline** —
+`build_batch`, `simulate`, the operations entry points — rather than by calling each
+component directly. That distinction is the point: an earlier version of this repository
+had correct components that the orchestration never called, and a component-level suite
+stayed green regardless. Each system test was mutation-checked by reintroducing the
+defect it guards against and confirming that it fails.
 
 ## Layout
 
@@ -91,19 +98,22 @@ src/chronos2_signal/
   storage.py        SQLite ledger (append-only forecasts) + Parquet snapshots
   holdout.py        the final-test lock
   market.py         panels aligned to the expected bar schedule
+  sources.py        session-bounded, split-consistent views: fixture and ledger
   actions.py        split audit, as-of units, wealth accounting
   quality.py        per-origin eligibility, one mask for every variant
   universe.py       candidate roster, selection rule, freeze guard
   features.py       12 task channels; 20 features + 1 missingness flag
   forecaster.py     frozen-checkpoint adapter; deterministic offline stub
+  forecast_store.py forecasts recorded to the append-only ledger before outcomes
   decision.py       ridge + logistic heads, disjoint-block Platt calibration
   policy.py         thresholds, ranking, capacity, deduplication
   portfolio.py      reference paper portfolio and its accounting
   protocol.py       labelled origins, folds, purges, holdout, refits
   variants.py       the five registered variants and the fixed controls
   evaluation.py     metrics, paired date-block bootstrap, promotion gates
-  pipeline.py       origin batches, labels, the walk-forward runner
-  operations.py     the after-close run and the registered study
+  pipeline.py       origin batches and labels, guard-checked
+  simulation.py     one session engine and one scoring path for every system
+  operations.py     after-close run, development comparison, study, final test
   notifier.py       renders persisted signals; contacts nothing
   cli.py            command line entry points
   fixtures.py       deterministic synthetic market for tests
@@ -128,12 +138,19 @@ docs/                 DESIGN, STATUS, BUILD_ORDER, INVARIANTS, ENVIRONMENT, AMEN
 - **Splits are audited, not assumed.** `auto_adjust=False` does not prove a field is an
   untouched quote. A split that cannot be resolved quarantines the episode rather than
   manufacturing a return, and screens run in as-of units so a later split cannot fail a
-  price floor the stock actually passed.
+  price floor the stock actually passed. A position held across an ex-date is
+  re-expressed in the new units, never marked in two.
 - **Dates are the unit of uncertainty.** Fifty stocks on one day are not fifty
   independent observations; every interval resamples date blocks, paired across
   competing systems.
-- **The holdout is locked in code.** Development-mode access to the reserved final-test
-  origins raises rather than returning rows.
+- **The holdout is locked on every path.** Batch construction, labels, realised
+  outcomes, simulation and ledger reads all check the guard, so development-mode access
+  to a reserved origin raises before any data is read. Studies then *verify* the result
+  — every origin they touched against the reserved set — and report the count, instead
+  of asserting that nothing was read.
+- **One engine, one scoring path.** Candidates, B0 and the momentum control run through
+  the same session loop, and the backtest scores origins with the same function as the
+  live after-close run. A backtest therefore describes the code that would run.
 
 ## Limitations that implementation cannot fix
 

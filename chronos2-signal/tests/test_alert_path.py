@@ -29,7 +29,9 @@ from chronos2_signal.operations import (
     run_after_close,
     run_study,
 )
-from chronos2_signal.pipeline import FixtureMarketSource, ResearchPipeline, WalkForwardRunner
+from chronos2_signal.pipeline import ResearchPipeline
+from chronos2_signal.simulation import WalkForwardRunner
+from chronos2_signal.sources import FixtureMarketSource
 from chronos2_signal.protocol import build_schedule
 from chronos2_signal.storage import Ledger
 
@@ -118,7 +120,9 @@ def test_alerts_fire_and_produce_reconciled_trades(fitted, permissive_config):
     for position in book.closed:
         if position.status != "closed":
             continue
-        ledger = runner.pipeline.source.action_ledger(position.symbol)
+        ledger = runner.pipeline.source.view(position.exit_session).action_ledger(
+            position.symbol
+        )
         account = book.accounting_for(position, ledger)
         assert account.reconciles()
         assert position.realised_net_return() == pytest.approx(account.net_return)
@@ -194,7 +198,7 @@ def test_study_runs_controls_and_gates(fitted, permissive_pipeline, tmp_path):
         schedule=schedule,
         variant="C256",
         checkpoint="plumbing-check",
-        fold_index=0,
+        folds=(0,),
         bootstrap_samples=200,
         code_revision="test",
         notes=("plumbing check on synthetic data",),

@@ -1,14 +1,24 @@
-"""Orchestration: origin batches, labels and the walk-forward runner.
+"""Origin batches and labels.
 
-This module is where the leakage guarantees become mechanical rather than
-aspirational. Everything an origin sees is fetched through
-:meth:`MarketSource.hourly_panel` and :meth:`MarketSource.daily_panel` bounded
-at that origin, and labels are produced by a separate call that is only made
-once the exit session has been observed.
+Everything an origin sees comes from one :class:`~chronos2_signal.sources.MarketView`
+bounded at that origin, so no feature can read a later bar. Labels come from a
+separate view bounded at the exit session, and are only asked for once that
+session has been observed.
 
-The runner drives the portfolio session by session rather than trade by trade,
-because overlapping holds, the entry-at-next-open convention and the drawdown
-pause are all properties of the session sequence.
+Three guarantees are enforced here rather than assumed:
+
+* **The holdout.** Every batch and every label is checked against the
+  pipeline's :class:`~chronos2_signal.holdout.HoldoutGuard` before any data is
+  read. A development run that reaches a reserved origin raises.
+* **The split contract.** Unusable split audits inside an origin's feature
+  window make that symbol ineligible; inside a holding window they make the
+  label unavailable. Neither is ever reconstructed from a guess.
+* **Forecasts before outcomes.** With a forecast cache attached, every forecast
+  is written to the append-only ledger when the batch is built -- before any
+  label for that origin is computed.
+
+The walk-forward simulation that consumes these batches lives in
+:mod:`chronos2_signal.simulation`.
 """
 
 from __future__ import annotations
@@ -16,78 +26,48 @@ from __future__ import annotations
 import datetime as dt
 import math
 from dataclasses import dataclass, field
-from typing import Callable, Mapping, Protocol, Sequence
+from typing import Callable, Mapping
 
 import numpy as np
 
-from .actions import ActionLedger, HoldingAccount, HoldingCosts, label_net_return
-from .calendar_spec import ExchangeCalendar
+from .actions import HoldingAccount, HoldingCosts, SplitAudit, label_net_return
+from .calendar_spec import CalendarError, ExchangeCalendar
 from .config import DesignConfig
-from .decision import DecisionModel, OriginRow, fit_decision_model
-from .evaluation import DailySeries, TradeRecord
+from .decision import OriginRow
 from .features import (
     DailyFeatures,
+    FeatureError,
     assemble_feature_row,
     build_chronos_task,
     build_daily_features,
     forecast_features,
     recommended_panel_bars,
 )
+from .forecast_store import ForecastCache
 from .forecaster import ForecastResult, Forecaster
 from .holdout import HoldoutGuard
-from .market import BarPanel, DailyPanel
-from .policy import AlertCandidate, OpenPositionView, PolicyEngine, PolicyOutcome
-from .portfolio import EntryRequest, ReferencePortfolio
+from .market import BarPanel, DailyPanel, MarketDataError, aligned_log_returns
 from .protocol import label_available_at
+from .provenance import stable_hash
 from .quality import EligibilityResult, evaluate_eligibility
+from .sources import MarketSource, MarketView, SourceError
 from .universe import WatchlistManifest
-from .variants import MomentumCandidate, rank_momentum_candidates, variant_spec
+from .variants import variant_spec
 
 __all__ = [
     "PipelineError",
-    "MarketSource",
-    "FixtureMarketSource",
     "OriginScore",
     "OriginBatch",
     "ResearchPipeline",
-    "BacktestResult",
-    "WalkForwardRunner",
 ]
+
+#: Failures that mean "this data is not available at this origin". Anything else
+#: is a defect and is allowed to propagate rather than being mistaken for a gap.
+_DATA_UNAVAILABLE = (CalendarError, MarketDataError, SourceError, ValueError, KeyError)
 
 
 class PipelineError(RuntimeError):
     """Raised when an origin cannot be processed."""
-
-
-class MarketSource(Protocol):
-    """Origin-bounded access to market data."""
-
-    def hourly_panel(
-        self, symbol: str, origin_session: dt.date, count: int
-    ) -> BarPanel:  # pragma: no cover
-        ...
-
-    def daily_panel(self, symbol: str) -> DailyPanel:  # pragma: no cover
-        ...
-
-    def action_ledger(self, symbol: str) -> ActionLedger:  # pragma: no cover
-        ...
-
-
-@dataclass
-class FixtureMarketSource:
-    """Market source backed by a :class:`~chronos2_signal.fixtures.SyntheticMarket`."""
-
-    market: object
-
-    def hourly_panel(self, symbol: str, origin_session: dt.date, count: int) -> BarPanel:
-        return self.market.panel_ending_at(symbol, origin_session, count)  # type: ignore[attr-defined]
-
-    def daily_panel(self, symbol: str) -> DailyPanel:
-        return self.market.daily(symbol)  # type: ignore[attr-defined]
-
-    def action_ledger(self, symbol: str) -> ActionLedger:
-        return self.market.action_ledger(symbol)  # type: ignore[attr-defined]
 
 
 @dataclass(frozen=True)
@@ -119,6 +99,10 @@ class OriginBatch:
     scores: tuple[OriginScore, ...]
     eligible_count: int
     notes: tuple[str, ...] = ()
+    #: Set when the market proxy itself was unusable at this origin.
+    scan_suppressed: bool = False
+    #: Sectors whose ETF input was unusable at this origin.
+    suppressed_sectors: frozenset[str] = frozenset()
 
     def scorable(self) -> tuple[OriginScore, ...]:
         return tuple(score for score in self.scores if score.scorable)
@@ -138,7 +122,15 @@ class OriginBatch:
 
 @dataclass
 class ResearchPipeline:
-    """Builds origin batches and labels under the registered configuration."""
+    """Builds origin batches and labels under the registered configuration.
+
+    Attributes:
+        guard: Holdout access control. The default reserves nothing, which is
+            right for integrity fixtures; every study replaces it with its
+            schedule's guard.
+        forecast_cache: When set, forecasts are recorded to and served from the
+            append-only ledger. The operational after-close run always sets it.
+    """
 
     config: DesignConfig
     calendar: ExchangeCalendar
@@ -147,6 +139,7 @@ class ResearchPipeline:
     forecaster: Forecaster | None = None
     guard: HoldoutGuard = field(default_factory=HoldoutGuard.open)
     market_proxy: str | None = None
+    forecast_cache: ForecastCache | None = None
 
     def __post_init__(self) -> None:
         if self.market_proxy is None:
@@ -166,8 +159,13 @@ class ResearchPipeline:
         Forecasts are generated for **every** eligible row, weak ones included.
         Keeping only the successful or alerted rows would bias both the fit and
         the calibration.
+
+        Raises:
+            HoldoutViolation: If the origin is reserved and the guard is locked.
         """
+        self.guard.check(origin_session, purpose=f"{variant} batch construction")
         spec = variant_spec(variant)
+        view = self.source.view(origin_session)
         notes: list[str] = []
         context = spec.context_length or self.config.model.context_length
         # Two independent requirements: the common eligibility mask is defined
@@ -179,39 +177,47 @@ class ResearchPipeline:
             recommended_panel_bars(context),
             self.config.universe.common_hourly_history_bars,
         )
+        proxy = self.market_proxy or "SPY"
 
-        market_daily = self.source.daily_panel(self.market_proxy or "SPY")
-        market_hourly = self._panel(self.market_proxy or "SPY", origin_session, panel_bars)
+        market_hourly, reason = self._usable_context_panel(view, proxy, panel_bars)
         if market_hourly is None:
             return OriginBatch(
                 origin_session=origin_session,
                 variant=variant,
                 scores=(),
                 eligible_count=0,
-                notes=("market proxy panel unavailable: whole scan suppressed",),
+                notes=(f"market proxy {proxy} unusable ({reason}): whole scan suppressed",),
+                scan_suppressed=True,
             )
+        market_daily = view.daily_panel(proxy)
 
         sector_daily: dict[str, DailyPanel] = {}
         sector_hourly: dict[str, BarPanel | None] = {}
+        suppressed = set(suppressed_sectors)
         for sector, etf in self.watchlist.sector_etfs().items():
-            sector_daily[sector] = self.source.daily_panel(etf)
-            sector_hourly[sector] = self._panel(etf, origin_session, panel_bars)
+            sector_hourly[sector], reason = self._usable_context_panel(view, etf, panel_bars)
             if sector_hourly[sector] is None:
-                notes.append(f"sector {sector}: ETF panel unavailable, sector suppressed")
+                suppressed.add(sector)
+                notes.append(f"sector {sector}: ETF {etf} unusable ({reason}), sector suppressed")
+            else:
+                sector_daily[sector] = view.daily_panel(etf)
 
         # Eligibility first, so that the peer set used for breadth contains only
         # eligible members -- breadth is watchlist breadth, not market breadth.
         eligibility: dict[str, EligibilityResult] = {}
         panels: dict[str, BarPanel] = {}
         for member in self.watchlist.members:
-            panel = self._panel(member.symbol, origin_session, panel_bars)
-            sector_panel = sector_hourly.get(member.sector)
-            if panel is None or sector_panel is None:
+            panel, reason = self._panel(view, member.symbol, panel_bars)
+            if panel is None or sector_hourly.get(member.sector) is None:
                 eligibility[member.symbol] = EligibilityResult(
                     symbol=member.symbol,
                     origin_session=origin_session,
                     eligible=False,
-                    failures=("panel: required hourly history unavailable at this origin",),
+                    failures=(
+                        f"panel: required hourly history unavailable at this origin ({reason})"
+                        if panel is None
+                        else "sector_suppressed: required sector input unavailable at this origin",
+                    ),
                 )
                 continue
             panels[member.symbol] = panel
@@ -220,15 +226,13 @@ class ResearchPipeline:
                 origin_session=origin_session,
                 config=self.config,
                 hourly=panel,
-                daily=self.source.daily_panel(member.symbol),
+                daily=view.daily_panel(member.symbol),
                 market_hourly=market_hourly,
-                sector_hourly=sector_panel,
-                action_ledger=self.source.action_ledger(member.symbol),
+                sector_hourly=sector_hourly[member.sector],  # type: ignore[arg-type]
+                action_ledger=view.action_ledger(member.symbol),
+                split_audits=_audits_in_window(view, member.symbol, panel),
                 issuer_id=member.issuer_id,
-                sector_suppressed=(
-                    member.sector in suppressed_sectors
-                    or sector_hourly.get(member.sector) is None
-                ),
+                sector_suppressed=member.sector in suppressed,
             )
 
         eligible_symbols = [
@@ -236,11 +240,10 @@ class ResearchPipeline:
         ]
         peers_by_sector: dict[str, dict[str, DailyPanel]] = {}
         for member in self.watchlist.members:
-            if member.symbol not in eligible_symbols:
-                continue
-            peers_by_sector.setdefault(member.sector, {})[member.symbol] = (
-                self.source.daily_panel(member.symbol)
-            )
+            if member.symbol in eligible_symbols:
+                peers_by_sector.setdefault(member.sector, {})[member.symbol] = (
+                    view.daily_panel(member.symbol)
+                )
 
         scores: list[OriginScore] = []
         tasks = []
@@ -264,7 +267,7 @@ class ResearchPipeline:
             daily_features = build_daily_features(
                 symbol=member.symbol,
                 origin_session=origin_session,
-                stock_daily=self.source.daily_panel(member.symbol),
+                stock_daily=view.daily_panel(member.symbol),
                 market_daily=market_daily,
                 sector_daily=sector_daily[member.sector],
                 peer_daily=peers_by_sector.get(member.sector, {}),
@@ -315,7 +318,7 @@ class ResearchPipeline:
                     horizon_sessions=self.config.model.horizon_sessions,
                     include_covariates=spec.include_covariates,
                 )
-            except Exception as exc:
+            except (FeatureError, CalendarError) as exc:
                 scores.append(
                     OriginScore(
                         symbol=member.symbol,
@@ -333,14 +336,22 @@ class ResearchPipeline:
             task_owners.append((member, result, daily_features))
 
         if tasks:
-            if self.forecaster is None:
-                raise PipelineError(
-                    f"variant {variant} needs forecasts but no forecaster is configured; "
-                    "the pipeline does not fabricate them"
-                )
-            forecasts = self.forecaster.predict(tasks)
-            for (member, result, daily_features), task, forecast in zip(
-                task_owners, tasks, forecasts, strict=True
+            forecasts, keys = self._forecast(
+                tasks,
+                variant=variant,
+                snapshot_hashes={
+                    task.symbol: stable_hash(
+                        [
+                            panels[task.symbol].snapshot_hash,
+                            market_hourly.snapshot_hash,
+                            sector_hourly[owner.sector].snapshot_hash,  # type: ignore[union-attr]
+                        ]
+                    )
+                    for task, (owner, _result, _daily) in zip(tasks, task_owners, strict=True)
+                },
+            )
+            for (member, result, daily_features), task, forecast, key in zip(
+                task_owners, tasks, forecasts, keys, strict=True
             ):
                 if not forecast.usable:
                     scores.append(
@@ -353,6 +364,7 @@ class ResearchPipeline:
                             features=None,
                             sigma_2d=daily_features.sigma_2d,
                             forecast=forecast,
+                            forecast_cache_key=key,
                             skip_reason=f"forecast blocked: {forecast.status.value}",
                         )
                     )
@@ -376,6 +388,7 @@ class ResearchPipeline:
                         ),
                         sigma_2d=daily_features.sigma_2d,
                         forecast=forecast,
+                        forecast_cache_key=key,
                     )
                 )
 
@@ -386,16 +399,62 @@ class ResearchPipeline:
             scores=tuple(scores),
             eligible_count=len(eligible_symbols),
             notes=tuple(notes),
+            suppressed_sectors=frozenset(suppressed),
         )
 
+    def _forecast(
+        self,
+        tasks: list,
+        *,
+        variant: str,
+        snapshot_hashes: Mapping[str, str],
+    ) -> tuple[list[ForecastResult], list[str | None]]:
+        if self.forecaster is None:
+            raise PipelineError(
+                f"variant {variant} needs forecasts but no forecaster is configured; "
+                "the pipeline does not fabricate them"
+            )
+        if self.forecast_cache is None:
+            return self.forecaster.predict(tasks), [None] * len(tasks)
+        pairs = self.forecast_cache.predict(
+            self.forecaster, tasks, variant=variant, snapshot_hashes=snapshot_hashes
+        )
+        return [result for result, _key in pairs], [key for _result, key in pairs]
+
+    @staticmethod
     def _panel(
-        self, symbol: str, origin_session: dt.date, count: int
-    ) -> BarPanel | None:
+        view: MarketView, symbol: str, count: int
+    ) -> tuple[BarPanel | None, str | None]:
+        """An hourly panel, or ``None`` with the reason it is unavailable.
+
+        A missing panel is a suppression input, never a filled-in series. Only
+        data-availability errors are converted; a defect propagates.
+        """
         try:
-            return self.source.hourly_panel(symbol, origin_session, count)
-        except Exception:
-            # A missing panel is a suppression input, never a filled-in series.
-            return None
+            return view.hourly_panel(symbol, count), None
+        except _DATA_UNAVAILABLE as exc:
+            return None, f"{type(exc).__name__}: {exc}"
+
+    def _usable_context_panel(
+        self, view: MarketView, symbol: str, count: int
+    ) -> tuple[BarPanel | None, str | None]:
+        """A market or sector input panel, unless its data is unusable.
+
+        A context series with an unresolved split in its window would feed a
+        manufactured move into every stock that uses it, so it is treated the
+        same as a missing one.
+        """
+        panel, reason = self._panel(view, symbol, count)
+        if panel is None:
+            return None, reason
+        unusable = [audit for audit in _audits_in_window(view, symbol, panel) if not audit.usable]
+        if unusable:
+            first = unusable[0]
+            return None, (
+                f"unresolved split on {first.action.ex_date.isoformat()} "
+                f"({first.verdict.value})"
+            )
+        return panel, None
 
     # -- labels ------------------------------------------------------------ #
 
@@ -408,20 +467,30 @@ class ResearchPipeline:
     ) -> HoldingAccount | None:
         """Realised net return of the reference policy for one origin.
 
-        Returns ``None`` when the entry or exit reference price is unavailable.
-        The caller keeps such a row out of fitting, and keeps the failed trade
-        visible in the ledger rather than dropping it.
+        Read from a view bounded at the exit session, so both reference prices
+        come from one consistently restated series. Returns ``None`` when the
+        entry or exit price is unavailable, or when a split inside the holding
+        window could not be resolved: that episode is quarantined rather than
+        turned into a manufactured return.
+
+        Raises:
+            HoldoutViolation: If the origin is reserved and the guard is locked.
         """
+        self.guard.check(origin_session, purpose="label read")
         timing = label_available_at(
             self.calendar,
             origin_session,
             horizon_sessions=self.config.model.horizon_sessions,
         )
-        daily = self.source.daily_panel(symbol)
+        view = self.source.view(timing.exit_session)
+        for audit in view.split_audits(symbol):
+            if timing.entry_session < audit.action.ex_date <= timing.exit_session and not audit.usable:
+                return None
+        daily = view.daily_panel(symbol)
         try:
             entry_row = daily.row(timing.entry_session)
             exit_row = daily.row(timing.exit_session)
-        except Exception:
+        except MarketDataError:
             return None
         entry_open = float(entry_row["open"])
         exit_close = float(exit_row["close"])
@@ -439,8 +508,35 @@ class ResearchPipeline:
             entry_open_price=entry_open,
             exit_close_price=exit_close,
             costs=costs,
-            ledger=self.source.action_ledger(symbol),
+            ledger=view.action_ledger(symbol),
         )
+
+    def realised_log_return(self, origin_session: dt.date, symbol: str) -> float | None:
+        """``100 * ln(C_D2 / C_D0)``: the quantity the forecast quantiles describe.
+
+        Both closes come from the exit-session view. Mixing a close from the
+        origin view with one from the exit view would compare two different
+        unit bases whenever a split fell between them.
+        """
+        self.guard.check(origin_session, purpose="realised outcome read")
+        timing = label_available_at(
+            self.calendar,
+            origin_session,
+            horizon_sessions=self.config.model.horizon_sessions,
+        )
+        view = self.source.view(timing.exit_session)
+        for audit in view.split_audits(symbol):
+            if origin_session < audit.action.ex_date <= timing.exit_session and not audit.usable:
+                return None
+        daily = view.daily_panel(symbol)
+        try:
+            start = float(daily.row(origin_session)["close"])
+            end = float(daily.row(timing.exit_session)["close"])
+        except MarketDataError:
+            return None
+        if not (math.isfinite(start) and math.isfinite(end)) or start <= 0.0 or end <= 0.0:
+            return None
+        return 100.0 * math.log(end / start)
 
     def labelled_rows(
         self, batch: OriginBatch, *, cost_scenario: str = "base"
@@ -476,499 +572,46 @@ class ResearchPipeline:
     def correlation_lookup(self, origin_session: dt.date) -> Callable[[str, str], float | None]:
         """Trailing daily-return correlation, bounded at ``origin_session``.
 
-        Returns ``None`` when the window cannot be filled, which blocks the
-        allocation rather than assuming independence.
+        Computed on the sessions both symbols actually have. Returns ``None``
+        when the window cannot be filled, which blocks the allocation rather
+        than assuming independence.
         """
         window = self.config.portfolio.correlation_window_sessions
-        cache: dict[str, np.ndarray | None] = {}
-
-        def returns_for(symbol: str) -> np.ndarray | None:
-            if symbol not in cache:
-                panel = self.source.daily_panel(symbol).up_to(origin_session)
-                series = panel.log_returns()
-                tail = series[-window:]
-                cache[symbol] = tail if tail.size >= window else None
-            return cache[symbol]
+        view = self.source.view(origin_session)
+        cache: dict[tuple[str, str], float | None] = {}
 
         def lookup(left: str, right: str) -> float | None:
             if left == right:
                 return 1.0
-            a, b = returns_for(left), returns_for(right)
-            if a is None or b is None:
-                return None
-            if np.std(a) == 0.0 or np.std(b) == 0.0:
-                return None
-            value = float(np.corrcoef(a, b)[0, 1])
-            return value if math.isfinite(value) else None
+            key = (left, right) if left <= right else (right, left)
+            if key in cache:
+                return cache[key]
+            value: float | None = None
+            joined = aligned_log_returns(view.daily_panel(key[0]), view.daily_panel(key[1]))
+            if joined is not None:
+                a, b = joined
+                if a.size >= window:
+                    a, b = a[-window:], b[-window:]
+                    finite = np.isfinite(a) & np.isfinite(b)
+                    if finite.all() and np.std(a) > 0.0 and np.std(b) > 0.0:
+                        candidate = float(np.corrcoef(a, b)[0, 1])
+                        value = candidate if math.isfinite(candidate) else None
+            cache[key] = value
+            return value
 
         return lookup
 
 
-@dataclass(frozen=True)
-class BacktestResult:
-    """Outcome of one walk-forward run for one system."""
+def _audits_in_window(
+    view: MarketView, symbol: str, panel: BarPanel
+) -> list[SplitAudit]:
+    """Split audits whose ex-date falls inside the data an origin reads.
 
-    variant: str
-    trades: tuple[TradeRecord, ...]
-    daily: DailySeries
-    portfolio: ReferencePortfolio
-    origins_scanned: int
-    alerts: int
-    no_alert_origins: tuple[dt.date, ...]
-    policy_outcomes: tuple[PolicyOutcome, ...]
-    forecaster_provenance: Mapping[str, object] = field(default_factory=dict)
-    notes: tuple[str, ...] = ()
-
-    def summary(self) -> dict[str, object]:
-        return {
-            "variant": self.variant,
-            "origins_scanned": self.origins_scanned,
-            "alerts": self.alerts,
-            "trades": len(self.trades),
-            "no_alert_origins": len(self.no_alert_origins),
-            "portfolio": self.portfolio.summary(),
-            "forecaster": dict(self.forecaster_provenance),
-            "notes": list(self.notes),
-        }
-
-
-@dataclass
-class WalkForwardRunner:
-    """Scores a block of origins and walks the reference portfolio through it."""
-
-    pipeline: ResearchPipeline
-    cost_scenario: str = "base"
-
-    @property
-    def config(self) -> DesignConfig:
-        return self.pipeline.config
-
-    def fit(
-        self,
-        variant: str,
-        *,
-        fit_sessions: Sequence[dt.date],
-        calibration_sessions: Sequence[dt.date],
-        fit_deadline: dt.datetime | None = None,
-        calibration_deadline: dt.datetime | None = None,
-        batch_cache: dict[tuple[str, dt.date], OriginBatch] | None = None,
-    ) -> DecisionModel:
-        """Fit one model from labelled rows of the two blocks."""
-        fit_rows: list[OriginRow] = []
-        calibration_rows: list[OriginRow] = []
-        for sessions, sink in (
-            (fit_sessions, fit_rows),
-            (calibration_sessions, calibration_rows),
-        ):
-            for session in sessions:
-                batch = self._batch(variant, session, batch_cache)
-                sink.extend(
-                    self.pipeline.labelled_rows(batch, cost_scenario=self.cost_scenario)
-                )
-        return fit_decision_model(
-            variant=variant,
-            fit_rows=fit_rows,
-            calibration_rows=calibration_rows,
-            config=self.config,
-            fit_deadline=fit_deadline,
-            calibration_deadline=calibration_deadline,
-        )
-
-    def run(
-        self,
-        variant: str,
-        *,
-        model: DecisionModel,
-        score_sessions: Sequence[dt.date],
-        portfolio: ReferencePortfolio | None = None,
-        batch_cache: dict[tuple[str, dt.date], OriginBatch] | None = None,
-        model_for: Callable[[dt.date], DecisionModel] | None = None,
-    ) -> BacktestResult:
-        """Score ``score_sessions`` in order and run the reference portfolio.
-
-        Args:
-            model_for: Optional prequential model selector. Supplying it is how
-                the registered 20-session refit schedule is replayed: the model
-                in force at an origin is the one fitted from matured history
-                before it.
-        """
-        if not score_sessions:
-            raise PipelineError("no origins to score")
-        calendar = self.pipeline.calendar
-        book = portfolio or ReferencePortfolio(
-            config=self.config, variant=variant, cost_scenario=self.cost_scenario
-        )
-        engine = PolicyEngine(self.config)
-
-        pending: dict[dt.date, list[EntryRequest]] = {}
-        outcomes: list[PolicyOutcome] = []
-        no_alert: list[dt.date] = []
-        alerts = 0
-        trades: list[TradeRecord] = []
-        entry_meta: dict[str, tuple[str, str]] = {}
-
-        ordered = sorted(set(score_sessions))
-        horizon_sessions = self.config.model.horizon_sessions
-        last_origin = ordered[-1]
-        final_exit = label_available_at(
-            calendar, last_origin, horizon_sessions=horizon_sessions
-        ).exit_session
-        walk_sessions = calendar.sessions(ordered[0], final_exit)
-
-        origin_set = set(ordered)
-        for session in walk_sessions:
-            # 1. Entries at the official open, sized from then-observable state.
-            due = pending.pop(session, [])
-            if due:
-                equity_at_open = (
-                    book.days[-1].equity
-                    if book.days
-                    else self.config.portfolio.initial_equity
-                )
-                gross_at_open = (
-                    book.days[-1].gross_exposure * book.days[-1].equity
-                    if book.days
-                    else 0.0
-                )
-                book.enter_all(
-                    due,
-                    equity_at_open=equity_at_open,
-                    gross_value_at_open=gross_at_open,
-                )
-
-            ledgers = {
-                position.symbol: self.pipeline.source.action_ledger(position.symbol)
-                for position in book.positions
-            }
-            book.apply_splits(session, ledgers)
-            book.credit_dividends(session, ledgers)
-            book.record_excursion(self._session_lows(book, session))
-
-            # 2. Scoring happens after the close of a signal session.
-            if session in origin_set:
-                active = model_for(session) if model_for is not None else model
-                outcome = self._score_origin(
-                    variant, session, active, book, engine, batch_cache
-                )
-                outcomes.append(outcome)
-                if outcome.alert_count == 0:
-                    no_alert.append(session)
-                alerts += outcome.alert_count
-                timing = label_available_at(
-                    calendar, session, horizon_sessions=horizon_sessions
-                )
-                for decision in outcome.alerts:
-                    candidate = decision.candidate
-                    entry_open = self._reference_price(
-                        candidate.symbol, timing.entry_session, "open"
-                    )
-                    if entry_open is None:
-                        continue
-                    entry_meta[candidate.symbol] = (
-                        candidate.issuer_id,
-                        candidate.sector,
-                    )
-                    pending.setdefault(timing.entry_session, []).append(
-                        EntryRequest(
-                            signal_id=f"{variant}-{session.isoformat()}-{candidate.symbol}",
-                            symbol=candidate.symbol,
-                            issuer_id=candidate.issuer_id,
-                            sector=candidate.sector,
-                            signal_session=session,
-                            entry_session=timing.entry_session,
-                            planned_exit_session=timing.exit_session,
-                            reference_open_price=entry_open,
-                            action_ledger=self.pipeline.source.action_ledger(
-                                candidate.symbol
-                            ),
-                        )
-                    )
-
-            # 3. Exits at the official close, then the daily mark.
-            closes = self._session_closes(book, session)
-            closed = book.close_due(session, closes, ledgers)
-            for position in closed:
-                trades.append(self._trade_record(position))
-            book.mark(session, self._session_closes(book, session))
-
-        return BacktestResult(
-            variant=variant,
-            trades=tuple(trades),
-            daily=DailySeries(
-                name=variant,
-                sessions=tuple(book.sessions()),
-                returns=np.asarray(book.daily_returns(), dtype=float),
-            ),
-            portfolio=book,
-            origins_scanned=len(ordered),
-            alerts=alerts,
-            no_alert_origins=tuple(no_alert),
-            policy_outcomes=tuple(outcomes),
-            forecaster_provenance=(
-                self.pipeline.forecaster.provenance()
-                if self.pipeline.forecaster is not None
-                else {"forecaster": "none"}
-            ),
-        )
-
-    # -- helpers ----------------------------------------------------------- #
-
-    def _batch(
-        self,
-        variant: str,
-        session: dt.date,
-        cache: dict[tuple[str, dt.date], OriginBatch] | None,
-    ) -> OriginBatch:
-        key = (variant, session)
-        if cache is not None and key in cache:
-            return cache[key]
-        batch = self.pipeline.build_batch(session, variant)
-        if cache is not None:
-            cache[key] = batch
-        return batch
-
-    def _score_origin(
-        self,
-        variant: str,
-        session: dt.date,
-        model: DecisionModel,
-        book: ReferencePortfolio,
-        engine: PolicyEngine,
-        cache: dict[tuple[str, dt.date], OriginBatch] | None,
-    ) -> PolicyOutcome:
-        batch = self._batch(variant, session, cache)
-        candidates: list[AlertCandidate] = []
-        for score in batch.scorable():
-            row = OriginRow(
-                origin_session=session,
-                symbol=score.symbol,
-                features=dict(score.features or {}),
-                sigma_2d=score.sigma_2d,
-                eligible_count=batch.eligible_count,
-            )
-            try:
-                estimate = model.estimate(row)
-            except Exception:
-                continue
-            candidates.append(
-                AlertCandidate(
-                    symbol=score.symbol,
-                    issuer_id=score.issuer_id,
-                    sector=score.sector,
-                    estimate=estimate,
-                    eligibility=score.eligibility,
-                    out_of_sample_observations=model.report.calibration_rows,
-                    out_of_sample_dates=model.report.calibration_dates,
-                )
-            )
-        open_views = [
-            OpenPositionView(
-                symbol=position.symbol,
-                issuer_id=position.issuer_id,
-                sector=position.sector,
-                planned_exit_session=position.planned_exit_session,
-            )
-            for position in book.positions
-        ]
-        return engine.evaluate(
-            origin_session=session,
-            candidates=candidates,
-            open_positions=open_views,
-            correlation=self.pipeline.correlation_lookup(session),
-            paused=book.paused,
-        )
-
-    def _reference_price(
-        self, symbol: str, session: dt.date, column: str
-    ) -> float | None:
-        try:
-            row = self.pipeline.source.daily_panel(symbol).row(session)
-        except Exception:
-            return None
-        value = float(row[column])
-        return value if math.isfinite(value) and value > 0.0 else None
-
-    def _session_closes(
-        self, book: ReferencePortfolio, session: dt.date
-    ) -> dict[str, float]:
-        prices: dict[str, float] = {}
-        for position in book.positions:
-            price = self._reference_price(position.symbol, session, "close")
-            if price is not None:
-                prices[position.symbol] = price
-            else:
-                # Mark at the entry fill rather than inventing a price, and let
-                # the exit path record the unresolved exit.
-                prices[position.symbol] = position.entry_fill_price
-        return prices
-
-    def _session_lows(
-        self, book: ReferencePortfolio, session: dt.date
-    ) -> dict[str, float]:
-        lows: dict[str, float] = {}
-        for position in book.positions:
-            price = self._reference_price(position.symbol, session, "low")
-            if price is not None:
-                lows[position.symbol] = price
-        return lows
-
-    def _trade_record(self, position: object) -> TradeRecord:
-        source = self.pipeline.source
-        ledger = source.action_ledger(position.symbol)
-        resolved = position.status == "closed"
-        base = position.realised_net_return() if resolved else float("nan")
-        scenarios: dict[str, float] = {"base": base}
-        for scenario in ("stress", "severe"):
-            if not resolved or position.exit_reference_price is None:
-                scenarios[scenario] = float("nan")
-                continue
-            slippage = self.config.execution.slippage_fraction(scenario)
-            account = label_net_return(
-                entry_session=position.entry_session,
-                exit_session=position.exit_session,  # type: ignore[arg-type]
-                entry_open_price=position.entry_reference_price,
-                exit_close_price=position.exit_reference_price,
-                costs=HoldingCosts(
-                    buy_slippage=slippage,
-                    sell_slippage=slippage,
-                    explicit_fee_fraction=self.config.execution.explicit_fee_fraction,
-                ),
-                ledger=ledger,
-            )
-            scenarios[scenario] = account.net_return
-        return TradeRecord(
-            origin_session=position.signal_session,
-            symbol=position.symbol,
-            issuer_id=position.issuer_id,
-            sector=position.sector,
-            r_net_base=scenarios["base"],
-            r_net_stress=scenarios["stress"],
-            r_net_severe=scenarios["severe"],
-            max_adverse_excursion=position.max_adverse_excursion,
-            resolved=resolved,
-        )
-
-    # -- momentum control -------------------------------------------------- #
-
-    def run_momentum_control(
-        self,
-        *,
-        score_sessions: Sequence[dt.date],
-        reference_variant: str = "B0",
-        batch_cache: dict[tuple[str, dt.date], OriginBatch] | None = None,
-        name: str = "momentum",
-    ) -> BacktestResult:
-        """The fixed relative-momentum control, on identical dates and costs.
-
-        It reuses the same eligibility mask and the same portfolio machinery, so
-        the only difference from a candidate is the selection rule.
-        """
-        calendar = self.pipeline.calendar
-        book = ReferencePortfolio(
-            config=self.config, variant=name, cost_scenario=self.cost_scenario
-        )
-        pending: dict[dt.date, list[EntryRequest]] = {}
-        trades: list[TradeRecord] = []
-        alerts = 0
-        no_alert: list[dt.date] = []
-
-        ordered = sorted(set(score_sessions))
-        horizon_sessions = self.config.model.horizon_sessions
-        final_exit = label_available_at(
-            calendar, ordered[-1], horizon_sessions=horizon_sessions
-        ).exit_session
-        origin_set = set(ordered)
-
-        for session in calendar.sessions(ordered[0], final_exit):
-            due = pending.pop(session, [])
-            if due:
-                equity_at_open = (
-                    book.days[-1].equity if book.days else self.config.portfolio.initial_equity
-                )
-                gross_at_open = (
-                    book.days[-1].gross_exposure * book.days[-1].equity if book.days else 0.0
-                )
-                book.enter_all(
-                    due, equity_at_open=equity_at_open, gross_value_at_open=gross_at_open
-                )
-            ledgers = {
-                position.symbol: self.pipeline.source.action_ledger(position.symbol)
-                for position in book.positions
-            }
-            book.apply_splits(session, ledgers)
-            book.credit_dividends(session, ledgers)
-            book.record_excursion(self._session_lows(book, session))
-
-            if session in origin_set:
-                batch = self._batch(reference_variant, session, batch_cache)
-                candidates = [
-                    MomentumCandidate(
-                        symbol=score.symbol,
-                        issuer_id=score.issuer_id,
-                        sector=score.sector,
-                        stock_minus_sector_5s=float(
-                            (score.daily.values if score.daily else {}).get(
-                                "f10_stock_minus_sector_return_5s", float("nan")
-                            )
-                        ),
-                    )
-                    for score in batch.scorable()
-                ]
-                picks = (
-                    []
-                    if book.paused
-                    else rank_momentum_candidates(
-                        candidates,
-                        config=self.config,
-                        open_sectors=book.sector_counts(),
-                        open_issuers=sorted(book.open_issuers()),
-                        open_position_count=len(book.positions),
-                    )
-                )
-                if not picks:
-                    no_alert.append(session)
-                alerts += len(picks)
-                timing = label_available_at(
-                    calendar, session, horizon_sessions=horizon_sessions
-                )
-                for pick in picks:
-                    entry_open = self._reference_price(
-                        pick.symbol, timing.entry_session, "open"
-                    )
-                    if entry_open is None:
-                        continue
-                    pending.setdefault(timing.entry_session, []).append(
-                        EntryRequest(
-                            signal_id=f"{name}-{session.isoformat()}-{pick.symbol}",
-                            symbol=pick.symbol,
-                            issuer_id=pick.issuer_id,
-                            sector=pick.sector,
-                            signal_session=session,
-                            entry_session=timing.entry_session,
-                            planned_exit_session=timing.exit_session,
-                            reference_open_price=entry_open,
-                            action_ledger=self.pipeline.source.action_ledger(pick.symbol),
-                        )
-                    )
-
-            closes = self._session_closes(book, session)
-            for position in book.close_due(session, closes, ledgers):
-                trades.append(self._trade_record(position))
-            book.mark(session, self._session_closes(book, session))
-
-        return BacktestResult(
-            variant=name,
-            trades=tuple(trades),
-            daily=DailySeries(
-                name=name,
-                sessions=tuple(book.sessions()),
-                returns=np.asarray(book.daily_returns(), dtype=float),
-            ),
-            portfolio=book,
-            origins_scanned=len(ordered),
-            alerts=alerts,
-            no_alert_origins=tuple(no_alert),
-            policy_outcomes=(),
-            forecaster_provenance={"forecaster": "none (fixed momentum control)"},
-            notes=("fixed relative-momentum control: identical dates, fills and costs",),
-        )
+    The hourly panel reaches furthest back of anything a feature uses -- the
+    daily features need at most sixty sessions -- so its first session bounds
+    the window. A split before it leaves no step in any feature input.
+    """
+    window_start = panel.bars[0].session
+    return [
+        audit for audit in view.split_audits(symbol) if window_start < audit.action.ex_date
+    ]

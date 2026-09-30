@@ -31,7 +31,7 @@ from .calendar_spec import (
     ExchangeCalendar,
     calendar_channel_matrix,
 )
-from .market import BarPanel, DailyPanel
+from .market import BarPanel, DailyPanel, aligned_log_returns
 
 __all__ = [
     "FeatureError",
@@ -630,7 +630,7 @@ def _beta(stock: DailyPanel, market: DailyPanel, *, window: int) -> float:
     Returns ``NaN`` when the market variance is degenerate, which masks the
     feature rather than producing a meaningless slope.
     """
-    joined = _aligned_returns(stock, market)
+    joined = aligned_log_returns(stock, market)
     if joined is None:
         return float("nan")
     stock_returns, market_returns = joined
@@ -647,20 +647,6 @@ def _beta(stock: DailyPanel, market: DailyPanel, *, window: int) -> float:
         return float("nan")
     covariance = float(np.cov(y, x, ddof=1)[0, 1])
     return covariance / variance
-
-
-def _aligned_returns(
-    left: DailyPanel, right: DailyPanel
-) -> tuple[np.ndarray, np.ndarray] | None:
-    """Log returns of two daily panels on their shared sessions."""
-    right_sessions = set(right.sessions)
-    shared = [session for session in left.sessions if session in right_sessions]
-    if len(shared) < 3:
-        return None
-    left_closes = left.frame.loc[shared, "close"].to_numpy(dtype=float)
-    right_closes = right.frame.loc[shared, "close"].to_numpy(dtype=float)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        return np.diff(np.log(left_closes)), np.diff(np.log(right_closes))
 
 
 def _sector_breadth(

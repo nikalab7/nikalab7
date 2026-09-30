@@ -18,6 +18,7 @@ Two properties make them useful for the integrity invariants:
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import hashlib
 from dataclasses import dataclass, field
@@ -29,6 +30,7 @@ import pandas as pd
 from .actions import ActionLedger, CorporateAction
 from .calendar_spec import BarSpec, ExchangeCalendar
 from .market import BarPanel, DailyPanel
+from .provenance import stable_hash
 
 __all__ = ["SyntheticSpec", "SyntheticMarket", "make_default_market"]
 
@@ -49,6 +51,13 @@ class SyntheticSpec:
         drift_bps_per_bar: Per-bar drift, per symbol. Zero by default.
         overnight_gap_bps: Standard deviation of the overnight gap.
         actions: Corporate actions to embed, per symbol.
+        emitted_price_jumps: Price discontinuities to write into the raw
+            series, as ``(ex_date, factor)`` per symbol: every price before the
+            ex-date is multiplied by ``factor`` and every volume divided by it.
+            This emulates a provider that did *not* restate a split. With the
+            factor equal to a declared split ratio the split audit should find
+            ``NOT_APPLIED`` and restate it; with a different factor it should
+            find the episode ambiguous and quarantine it.
     """
 
     symbols: tuple[str, ...]
@@ -66,6 +75,47 @@ class SyntheticSpec:
     overnight_gap_bps: float = 45.0
     base_volume: float = 1_500_000.0
     actions: Mapping[str, tuple[CorporateAction, ...]] = field(default_factory=dict)
+    emitted_price_jumps: Mapping[str, tuple[tuple[dt.date, float], ...]] = field(
+        default_factory=dict
+    )
+
+    def spec_hash(self) -> str:
+        """Identity of everything that determines the generated numbers.
+
+        Forecast cache keys include it, so a fixture with a different seed or
+        drift can never be served another fixture's cached forecasts.
+        """
+        return stable_hash(
+            {
+                "symbols": list(self.symbols),
+                "sectors": dict(self.sectors),
+                "market_proxy": self.market_proxy,
+                "sector_etfs": dict(self.sector_etfs),
+                "start": self.start.isoformat(),
+                "end": self.end.isoformat(),
+                "seed": self.seed,
+                "base_price": dict(self.base_price),
+                "drift_bps_per_bar": dict(self.drift_bps_per_bar),
+                "vols": [
+                    self.bar_vol_bps,
+                    self.market_vol_bps,
+                    self.sector_vol_bps,
+                    self.overnight_gap_bps,
+                    self.base_volume,
+                ],
+                "actions": {
+                    symbol: [
+                        [action.ex_date.isoformat(), action.action_type, action.value]
+                        for action in actions
+                    ]
+                    for symbol, actions in self.actions.items()
+                },
+                "emitted_price_jumps": {
+                    symbol: [[ex_date.isoformat(), factor] for ex_date, factor in jumps]
+                    for symbol, jumps in self.emitted_price_jumps.items()
+                },
+            }
+        )
 
     def all_symbols(self) -> tuple[str, ...]:
         return tuple(
@@ -93,6 +143,7 @@ class SyntheticMarket:
         self._factors = self._build_factors()
         self._panels: dict[str, BarPanel] = {}
         self._daily: dict[str, DailyPanel] = {}
+        self.spec_hash = spec.spec_hash()
 
     # -- factor structure -------------------------------------------------- #
 
@@ -201,13 +252,24 @@ class SyntheticMarket:
                 * volume_rng.lognormal(0.0, 0.18)
             )
 
+        volumes = np.round(volumes)
+
+        # Emulate a provider that did not restate a split: before each emitted
+        # ex-date, prices carry the pre-split level and volumes the pre-split
+        # share count. The economic path underneath is unchanged.
+        for ex_date, factor in self.spec.emitted_price_jumps.get(symbol, ()):
+            before = np.asarray([bar.session < ex_date for bar in self.bars], dtype=bool)
+            for series in (opens, highs, lows, closes):
+                series[before] = series[before] * factor
+            volumes[before] = volumes[before] / factor
+
         observations = pd.DataFrame(
             {
                 "open": opens,
                 "high": highs,
                 "low": lows,
                 "close": closes,
-                "volume": np.round(volumes),
+                "volume": volumes,
             },
             index=pd.DatetimeIndex([bar.start for bar in self.bars]),
         )
@@ -216,7 +278,7 @@ class SyntheticMarket:
             "1h",
             self.bars,
             observations,
-            snapshot_hash=f"fixture-{symbol}-1h",
+            snapshot_hash=f"fixture-{self.spec_hash[:16]}-{symbol}-1h",
         )
         self._panels[symbol] = panel
         return panel
@@ -240,7 +302,7 @@ class SyntheticMarket:
                 "volume": float(observed["volume"].sum()),
             }
         daily = DailyPanel.from_records(
-            symbol, rows, snapshot_hash=f"fixture-{symbol}-1d"
+            symbol, rows, snapshot_hash=f"fixture-{self.spec_hash[:16]}-{symbol}-1d"
         )
         self._daily[symbol] = daily
         return daily
@@ -297,24 +359,11 @@ class SyntheticMarket:
         earlier bars of the full fixture exactly, so any difference in a feature
         is caused by the pipeline rather than by the data generator.
         """
-        spec = SyntheticSpec(
-            symbols=self.spec.symbols,
-            sectors=self.spec.sectors,
-            market_proxy=self.spec.market_proxy,
-            sector_etfs=self.spec.sector_etfs,
-            start=self.spec.start,
-            end=last_session,
-            seed=self.spec.seed,
-            base_price=self.spec.base_price,
-            drift_bps_per_bar=self.spec.drift_bps_per_bar,
-            bar_vol_bps=self.spec.bar_vol_bps,
-            market_vol_bps=self.spec.market_vol_bps,
-            sector_vol_bps=self.spec.sector_vol_bps,
-            overnight_gap_bps=self.spec.overnight_gap_bps,
-            base_volume=self.spec.base_volume,
-            actions=self.spec.actions,
+        # replace() rather than a hand-written field list: a field added to the
+        # spec later cannot be silently dropped from the truncated copy.
+        return SyntheticMarket(
+            self.calendar, dataclasses.replace(self.spec, end=last_session)
         )
-        return SyntheticMarket(self.calendar, spec)
 
 
 def make_default_market(

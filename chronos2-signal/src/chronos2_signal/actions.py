@@ -33,6 +33,7 @@ __all__ = [
     "ActionLedger",
     "SplitVerdict",
     "SplitAudit",
+    "SPLIT_TOLERANCE",
     "audit_split_convention",
     "to_split_consistent",
     "to_asof_units",
@@ -42,6 +43,13 @@ __all__ = [
     "label_net_return",
     "max_adverse_excursion",
 ]
+
+
+#: Relative band around each split hypothesis -- "no step" or "a step of exactly
+#: the ratio". A split closer to one than twice this cannot be told apart from
+#: an ordinary move. It is an engineering starting assumption, not a measured
+#: property of the feed.
+SPLIT_TOLERANCE = 0.08
 
 
 class ActionError(RuntimeError):
@@ -217,7 +225,7 @@ def audit_split_convention(
     closes: Sequence[float],
     volumes: Sequence[float] | None = None,
     *,
-    tolerance: float = 0.08,
+    tolerance: float = SPLIT_TOLERANCE,
 ) -> SplitAudit:
     """Decide whether ``closes`` already reflects ``split``.
 

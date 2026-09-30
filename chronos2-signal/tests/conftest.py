@@ -15,7 +15,8 @@ from chronos2_signal.calendar_spec import ExchangeCalendar
 from chronos2_signal.config import load_design
 from chronos2_signal.fixtures import SyntheticMarket, SyntheticSpec
 from chronos2_signal.forecaster import DeterministicStubForecaster
-from chronos2_signal.pipeline import FixtureMarketSource, ResearchPipeline
+from chronos2_signal.pipeline import ResearchPipeline
+from chronos2_signal.sources import FixtureMarketSource
 from chronos2_signal.universe import Candidate, CandidateRoster, select_watchlist
 
 # A window long enough to satisfy the registered eligibility mask (512

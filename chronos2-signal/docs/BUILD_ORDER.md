@@ -3,6 +3,13 @@
 Section 20 of the [registered protocol](DESIGN.md). Each step lists what the
 repository provides and what still requires data, weights or elapsed time.
 
+> **Correction, 30 September 2026.** The first version of this file marked steps 4–6
+> *implemented, not run*. That overstated it: the components existed, but the
+> orchestration that would run them did not — no ledger-backed data source reached the
+> pipeline, forecasts were never written to the ledger, B0 was absent from the study
+> runner, and nothing replayed the refit schedule. An architecture review found this;
+> the orchestration now exists and the labels below describe it.
+
 ## 1. Freeze the protocol and the universe — *partly done*
 
 Freeze the protocol, obtain the independent candidate roster, and create the
@@ -51,13 +58,15 @@ Build persistence/momentum/B0 baselines and the frozen causal forecast cache,
 keeping final-test outcomes hidden.
 
 - **Done:** B0, the fixed relative-momentum control, the exposure-matched market
-  benchmark and zero-return cash all run through the same portfolio, fills and
-  costs (`variants`, `pipeline`, `portfolio`). The forecast cache key covers the
-  checkpoint revision, package version, schema version, symbol, origin, context,
-  horizon, channel set, cross-learning flag and source snapshot hash
-  (`provenance.forecast_cache_key`), and `forecasts` is append-only at the
-  database level. `holdout.HoldoutGuard` makes the reserved origins unreadable in
-  development mode.
+  benchmark and zero-return cash all run through one session engine
+  (`simulation.simulate`) with identical fills, costs and capital accounting. The
+  collector's ledger reaches the pipeline through `sources.LedgerMarketSource`, at a
+  point-in-time or a declared latest vintage. Every forecast is written to the
+  append-only `forecasts` table when its batch is built, before any label for that
+  origin exists (`forecast_store.ForecastCache`), under a key covering the checkpoint
+  revision, package version, input schema, symbol, origin, context, horizon, channel
+  set, cross-learning flag and source snapshot hash. `holdout.HoldoutGuard` is checked
+  on every research path, not only on ledger reads.
 - **Outstanding:** running it, which needs step 2's data and the `model` extra.
 
 ## 5. Registered development comparison — *implemented, not run*
@@ -65,25 +74,36 @@ keeping final-test outcomes hidden.
 Run only the registered development comparisons. Freeze the selected version or
 record no winner.
 
-- **Done:** the five variants are the only ones `variant_spec` accepts; anything
-  else raises. `operations.run_study` runs one fold against all controls on one
-  shared date index with the paired date-block bootstrap.
-- **Outstanding:** the actual comparison. Development selection also requires at
-  least 40 executed development-validation trades across 25 distinct sessions;
-  "no winner" is a permitted and recorded outcome.
+- **Done:** `operations.run_development_comparison` runs every registered variant —
+  B0 always included — across the development folds, one model per fold and one
+  portfolio per system carried across fold boundaries, with the fixed controls on the
+  same dates. The paired bootstrap resamples identical date blocks for every system
+  and reports each candidate against B0, against momentum, against its own
+  exposure-matched benchmark and against every other candidate.
+  `operations.select_candidate` applies the section-12 rule, including its floors of
+  40 trades across 25 sessions, and records *no winner* — retaining C256 without
+  declaring it superior — whenever the evidence does not separate the leader. The
+  out-of-sample predictive report (Brier against each model's own training base rate,
+  reliability, p10–p90 coverage, terminal pinball against a trailing-volatility
+  reference, median error against persistence, and cross-sectional rank IC) now feeds
+  gate 7, which previously received hard-coded `NaN`.
+- **Outstanding:** the actual comparison, on real data.
 
 ## 6. The single final historical test — *implemented, not run*
 
 Execute the final historical protocol once, including the predefined refit
 schedule and costs.
 
-- **Done:** `protocol.build_schedule` reserves the last 60 labelled origins and
-  builds the 20-session prequential refit points from the schedule alone, so the
-  same points are replayed whether the test is being planned or executed.
-  `HoldoutGuard.unlock_final_test` is a deliberate, one-way action within a
-  process.
+- **Done:** `protocol.build_schedule` reserves the last 60 labelled origins, purges
+  the two origins before them so that no development outcome window reaches the test
+  block, and builds the 20-session prequential refit points from the schedule alone.
+  `operations.run_final_test` replays exactly those refit points — each one fitted
+  from history that had matured by its deadline — under a deliberately unlocked
+  guard, for the candidate and B0 alike.
 - **Outstanding:** the single pass. A failed test cannot be relabelled development
-  and reused.
+  and reused. Nothing yet stops a second pass *across processes*: the guard's
+  unlock is one-way within a process only, and "once" is still a discipline rather
+  than a mechanism.
 
 ## 7. Forward paper ledger — *not started*
 

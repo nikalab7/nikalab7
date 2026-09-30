@@ -20,6 +20,7 @@ from __future__ import annotations
 import datetime as dt
 import math
 from dataclasses import dataclass, field
+from statistics import NormalDist
 from typing import Mapping, Sequence
 
 import numpy as np
@@ -38,6 +39,9 @@ __all__ = [
     "brier_score",
     "reliability_table",
     "spearman_correlation",
+    "LabelledPrediction",
+    "PredictiveReport",
+    "predictive_report",
     "block_profitability",
     "contributor_concentration",
     "GateResult",
@@ -295,14 +299,19 @@ def paired_block_bootstrap(
     block_sessions: int,
     samples: int,
     confidence: float,
-    reference: str | None = None,
+    differences: Sequence[tuple[str, str]] = (),
     seed: int = 20260927,
 ) -> dict[str, BootstrapEstimate]:
-    """Intervals for every system, and for differences against ``reference``.
+    """Intervals for every system, and for each requested ``(a, b)`` difference.
 
     All systems are resampled on the **same** date blocks. That is what makes
     an incremental claim meaningful: the candidate and its baseline see the same
     days, so contemporaneous dependence is preserved rather than averaged away.
+
+    Differences are named explicitly -- ``C256`` against ``B0``, against the
+    momentum control, against its own exposure-matched benchmark -- because
+    each answers a different question, and a single reference system cannot
+    ask all of them.
     """
     if not systems:
         return {}
@@ -340,26 +349,25 @@ def paired_block_bootstrap(
             n_sessions=n,
         )
 
-    if reference is not None:
-        if reference not in replicate_means:
-            raise EvaluationError(f"reference system {reference!r} was not supplied")
-        base = replicate_means[reference]
-        base_point = estimates[reference].point
-        for name, means in replicate_means.items():
-            if name == reference:
-                continue
-            difference = means - base
-            lower, upper = np.quantile(difference, [alpha, 1.0 - alpha])
-            estimates[f"{name}_minus_{reference}"] = BootstrapEstimate(
-                name=f"{name}_minus_{reference}",
-                point=estimates[name].point - base_point,
-                lower=float(lower),
-                upper=float(upper),
-                confidence=confidence,
-                block_sessions=block_sessions,
-                samples=samples,
-                n_sessions=n,
-            )
+    for left, right in differences:
+        for name in (left, right):
+            if name not in replicate_means:
+                raise EvaluationError(f"system {name!r} was not supplied to the bootstrap")
+        if left == right:
+            raise EvaluationError(f"cannot difference {left!r} against itself")
+        difference = replicate_means[left] - replicate_means[right]
+        lower, upper = np.quantile(difference, [alpha, 1.0 - alpha])
+        key = f"{left}_minus_{right}"
+        estimates[key] = BootstrapEstimate(
+            name=key,
+            point=estimates[left].point - estimates[right].point,
+            lower=float(lower),
+            upper=float(upper),
+            confidence=confidence,
+            block_sessions=block_sessions,
+            samples=samples,
+            n_sessions=n,
+        )
     return estimates
 
 
@@ -490,6 +498,176 @@ def _average_ranks(values: np.ndarray) -> np.ndarray:
             tied = inverse == index
             ranks[tied] = ranks[tied].mean()
     return ranks
+
+
+@dataclass(frozen=True)
+class LabelledPrediction:
+    """One out-of-sample scored row with its realised outcome attached.
+
+    Attributes:
+        base_rate: Training-derived positive rate of the model that scored the
+            row -- the constant the calibrated probability has to beat.
+        r_net: Realised net return of the reference policy (base costs).
+        realised_log_return: ``100 * ln(C_D2 / C_D0)``, the quantity the
+            forecast quantiles describe; ``None`` if it could not be observed.
+        terminal_quantiles: Forecast quantiles at the D2 terminal bar, in the
+            same units; ``None`` for a variant without a forecast.
+    """
+
+    origin_session: dt.date
+    symbol: str
+    calibrated_probability: float
+    estimated_net_return: float
+    sigma_2d: float
+    base_rate: float
+    r_net: float
+    realised_log_return: float | None = None
+    terminal_quantiles: Mapping[float, float] | None = None
+
+
+@dataclass(frozen=True)
+class PredictiveReport:
+    """Out-of-sample predictive diagnostics (section 14).
+
+    A model can improve price error without improving selection, and the
+    reverse, so the forecast diagnostics and the probability diagnostics are
+    reported side by side rather than rolled into one score.
+    """
+
+    rows: int
+    dates: int
+    brier: float
+    base_rate_brier: float
+    reliability: tuple[Mapping[str, float], ...]
+    coverage_p10_p90: float
+    pinball_terminal: float
+    pinball_trailing_vol_reference: float
+    median_abs_error: float
+    persistence_abs_error: float
+    rank_ic_mean: float
+    rank_ic_dates: int
+
+    @property
+    def beats_base_rate(self) -> bool:
+        return (
+            math.isfinite(self.brier)
+            and math.isfinite(self.base_rate_brier)
+            and self.brier < self.base_rate_brier
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "rows": self.rows,
+            "dates": self.dates,
+            "brier": self.brier,
+            "base_rate_brier": self.base_rate_brier,
+            "beats_base_rate": self.beats_base_rate,
+            "reliability": [dict(row) for row in self.reliability],
+            "coverage_p10_p90": self.coverage_p10_p90,
+            "pinball_terminal": self.pinball_terminal,
+            "pinball_trailing_vol_reference": self.pinball_trailing_vol_reference,
+            "median_abs_error": self.median_abs_error,
+            "persistence_abs_error": self.persistence_abs_error,
+            "rank_ic_mean": self.rank_ic_mean,
+            "rank_ic_dates": self.rank_ic_dates,
+        }
+
+
+def predictive_report(
+    rows: Sequence[LabelledPrediction],
+    *,
+    quantile_levels: Sequence[float],
+    reliability_bins: int = 5,
+) -> PredictiveReport:
+    """Probability, forecast and ranking diagnostics over labelled predictions.
+
+    * **Brier** of the calibrated probability against ``1[R_net > 0]``, next to
+      the Brier of each row's own training base rate -- the comparison gate 7
+      requires.
+    * **Coverage** of the D2 p10-p90 band, **pinball loss** at the terminal bar,
+      and the same pinball for a trailing-volatility reference band, so a
+      forecast is judged against a simple alternative and not in isolation.
+    * **Median error** against **persistence**, the zero-change forecast.
+    * **Rank IC**: the cross-sectional Spearman association between estimated
+      and realised net return, averaged over dates -- dates, not rows, because
+      fifty stocks on one day are one observation of cross-sectional skill.
+    """
+    levels = [float(level) for level in quantile_levels]
+    if not rows:
+        nan = float("nan")
+        return PredictiveReport(
+            rows=0, dates=0, brier=nan, base_rate_brier=nan, reliability=(),
+            coverage_p10_p90=nan, pinball_terminal=nan,
+            pinball_trailing_vol_reference=nan, median_abs_error=nan,
+            persistence_abs_error=nan, rank_ic_mean=nan, rank_ic_dates=0,
+        )
+
+    probabilities = np.asarray([row.calibrated_probability for row in rows], dtype=float)
+    outcomes = np.asarray([1 if row.r_net > 0.0 else 0 for row in rows], dtype=int)
+    base_rates = np.asarray([row.base_rate for row in rows], dtype=float)
+
+    forecast_rows = [
+        row
+        for row in rows
+        if row.terminal_quantiles is not None
+        and row.realised_log_return is not None
+        and math.isfinite(row.realised_log_return)
+    ]
+    nan = float("nan")
+    coverage = pinball = reference_pinball = median_error = persistence_error = nan
+    if forecast_rows:
+        realised = np.asarray([row.realised_log_return for row in forecast_rows], dtype=float)
+        coverage = interval_coverage(
+            [row.terminal_quantiles[0.10] for row in forecast_rows],  # type: ignore[index]
+            [row.terminal_quantiles[0.90] for row in forecast_rows],  # type: ignore[index]
+            realised,
+        )
+        losses = []
+        reference_losses = []
+        normal = NormalDist()
+        for row, actual in zip(forecast_rows, realised, strict=True):
+            predicted = np.asarray([row.terminal_quantiles[level] for level in levels])  # type: ignore[index]
+            losses.append(pinball_loss(levels, predicted, [actual]))
+            # A trailing-volatility band in the target's units: the two-session
+            # volatility scale, times 100 for the rebased log units.
+            reference = np.asarray(
+                [100.0 * normal.inv_cdf(level) * row.sigma_2d for level in levels]
+            )
+            reference_losses.append(pinball_loss(levels, reference, [actual]))
+        pinball = float(np.mean(losses))
+        reference_pinball = float(np.mean(reference_losses))
+        medians = np.asarray(
+            [row.terminal_quantiles[0.50] for row in forecast_rows], dtype=float  # type: ignore[index]
+        )
+        median_error = float(np.mean(np.abs(medians - realised)))
+        persistence_error = float(np.mean(np.abs(realised)))
+
+    by_date: dict[dt.date, list[LabelledPrediction]] = {}
+    for row in rows:
+        by_date.setdefault(row.origin_session, []).append(row)
+    ics = [
+        spearman_correlation(
+            [row.estimated_net_return for row in group], [row.r_net for row in group]
+        )
+        for group in by_date.values()
+        if len(group) >= 3
+    ]
+    finite_ics = [value for value in ics if math.isfinite(value)]
+
+    return PredictiveReport(
+        rows=len(rows),
+        dates=len(by_date),
+        brier=brier_score(probabilities, outcomes),
+        base_rate_brier=float(np.mean((base_rates - outcomes) ** 2)),
+        reliability=tuple(reliability_table(probabilities, outcomes, bins=reliability_bins)),
+        coverage_p10_p90=coverage,
+        pinball_terminal=pinball,
+        pinball_trailing_vol_reference=reference_pinball,
+        median_abs_error=median_error,
+        persistence_abs_error=persistence_error,
+        rank_ic_mean=float(np.mean(finite_ics)) if finite_ics else nan,
+        rank_ic_dates=len(finite_ics),
+    )
 
 
 # --------------------------------------------------------------------------- #

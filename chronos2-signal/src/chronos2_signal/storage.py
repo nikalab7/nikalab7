@@ -16,12 +16,13 @@ Design constraints this module enforces rather than documents:
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import json
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 from .holdout import HoldoutGuard
 
@@ -403,6 +404,27 @@ class Ledger:
     def connection(self) -> sqlite3.Connection:
         return self._conn
 
+    @contextlib.contextmanager
+    def transaction(self) -> Iterator["Ledger"]:
+        """Group writes so they land together or not at all.
+
+        The connection runs in autocommit mode, so without this every insert is
+        its own transaction: a crash half-way through an origin's signals would
+        leave a partial set behind. A nested call joins the outer transaction
+        rather than committing early.
+        """
+        if self._conn.in_transaction:
+            yield self
+            return
+        self._conn.execute("BEGIN")
+        try:
+            yield self
+        except BaseException:
+            self._conn.execute("ROLLBACK")
+            raise
+        else:
+            self._conn.execute("COMMIT")
+
     def tables(self) -> list[str]:
         rows = self._conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
@@ -463,16 +485,22 @@ class Ledger:
         self._insert("source_snapshots", row, mode="ignore")
 
     def record_bars(self, rows: Iterable[Mapping[str, Any]]) -> int:
+        """Store one snapshot's bars in a single transaction.
+
+        A snapshot is all-or-nothing: a half-written snapshot would be read as a
+        complete vintage with holes in it.
+        """
         count = 0
-        for row in rows:
-            payload = dict(row)
-            payload["bar_start"] = _iso(payload["bar_start"])
-            payload["bar_end"] = _iso(payload["bar_end"])
-            payload["session"] = _iso(payload["session"])
-            payload["retrieved_at"] = _iso(payload["retrieved_at"])
-            payload["observed"] = int(bool(payload["observed"]))
-            self._insert("bars", payload, mode="ignore")
-            count += 1
+        with self.transaction():
+            for row in rows:
+                payload = dict(row)
+                payload["bar_start"] = _iso(payload["bar_start"])
+                payload["bar_end"] = _iso(payload["bar_end"])
+                payload["session"] = _iso(payload["session"])
+                payload["retrieved_at"] = _iso(payload["retrieved_at"])
+                payload["observed"] = int(bool(payload["observed"]))
+                self._insert("bars", payload, mode="ignore")
+                count += 1
         return count
 
     def read_bars(
@@ -490,6 +518,10 @@ class Ledger:
         or before ``as_of`` is returned. Passing ``as_of`` is how a backtest
         replays the vintage a decision actually saw instead of today's
         corrected history.
+
+        Two snapshots retrieved at the same instant -- two requests in one run
+        that overlap -- are broken by snapshot id, so the result never depends
+        on SQLite's row order.
         """
         clauses = ["symbol = ?", "interval = ?"]
         params: list[Any] = [symbol, interval]
@@ -502,19 +534,15 @@ class Ledger:
         if as_of is not None:
             clauses.append("retrieved_at <= ?")
             params.append(_iso(as_of))
-        where = " AND ".join(clauses)
-        sql = f"""
-            SELECT b.* FROM bars b
-            JOIN (
-                SELECT bar_start, MAX(retrieved_at) AS latest
-                FROM bars WHERE {where}
-                GROUP BY bar_start
-            ) pick
-            ON b.bar_start = pick.bar_start AND b.retrieved_at = pick.latest
-            WHERE {where}
-            ORDER BY b.bar_start
-        """
-        return self.query(sql, params + params)
+        rows = self.query(
+            f"SELECT * FROM bars WHERE {' AND '.join(clauses)} "
+            "ORDER BY bar_start, retrieved_at, snapshot_id",
+            params,
+        )
+        latest: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            latest[str(row["bar_start"])] = row  # ordered, so the last one wins
+        return [latest[key] for key in sorted(latest)]
 
     def record_corporate_action(self, **fields: Any) -> None:
         row = dict(fields)
@@ -600,6 +628,11 @@ class Ledger:
         ).fetchone()
         if existing is not None:
             for column, value in row.items():
+                # When a forecast was generated is metadata about the run, not
+                # part of the forecast. Comparing it would make every retry
+                # look like a conflicting revision.
+                if column == "generated_at":
+                    continue
                 if existing[column] != value:
                     raise StorageError(
                         f"forecast {row['cache_key']} already stored with a different "

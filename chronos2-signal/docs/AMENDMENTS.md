@@ -38,3 +38,24 @@ amendment.
 - **Fractional shares** are permitted in the reference paper portfolio, so that position
   sizing is exactly 10% of equity rather than 10% rounded to a whole share. This is an
   evaluation convention; it is not a claim about a real account.
+- **Scoring after the close** (30 September 2026). The walk-forward loop now scores an
+  origin after that session's exits and daily mark. The earlier order contradicted
+  section 10 — "new next-open entries use the state after that close" — so this corrects
+  the implementation toward the text rather than changing it.
+
+## Clarification that departs from the letter of the text
+
+Listed separately because, unlike the entries above, it changes which origins belong to
+which block. If a reader judges it an amendment, it should be registered as one.
+
+- **A purge between development and the final test** (30 September 2026). Section 13
+  says the last 60 labelled origins form the test and "earlier post-checkpoint origins
+  form development". Taken literally, the last development origins' two-session outcome
+  windows then reach into the first test origins' holding windows, so development
+  selection can read part of a reserved outcome. Section 13 also states the principle
+  that "overlapping outcome windows may not leak future labels across" a boundary, and
+  applies a two-session purge at every fold boundary for exactly this reason. The same
+  purge is now applied at the development/test boundary: the two origins immediately
+  before the test belong to neither block. On the current data edge this moves
+  development from 164 to 162 origins and leaves the fold count at two; the test block
+  and its 60 origins are unchanged.

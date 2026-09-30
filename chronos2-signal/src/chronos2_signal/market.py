@@ -30,6 +30,8 @@ __all__ = [
     "BarPanel",
     "DailyPanel",
     "OHLCV_COLUMNS",
+    "PRICE_COLUMNS",
+    "aligned_log_returns",
 ]
 
 
@@ -38,6 +40,12 @@ class MarketDataError(RuntimeError):
 
 
 OHLCV_COLUMNS = ("open", "high", "low", "close", "volume")
+
+#: Columns that a split restates as prices (divided by the ratio). Volume is
+#: restated as a quantity instead. ``adj_close`` is deliberately absent: it is
+#: the provider's own total-return series, is never used for features or
+#: labels, and is kept exactly as delivered.
+PRICE_COLUMNS = ("open", "high", "low", "close")
 
 
 def _as_utc_index(values: Iterable) -> pd.DatetimeIndex:
@@ -332,6 +340,26 @@ class DailyPanel:
         if session not in self.frame.index:
             raise MarketDataError(f"{self.symbol}: no daily row for {session.isoformat()}")
         return self.frame.loc[session]
+
+
+def aligned_log_returns(
+    left: DailyPanel, right: DailyPanel
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Log returns of two daily panels over the sessions both of them have.
+
+    Aligning by session rather than by position is the point. If one symbol is
+    missing a day -- a halt, a late listing, a data gap -- positional tails of
+    the two series are shifted against each other, and any correlation or beta
+    computed from them silently compares different days.
+    """
+    right_sessions = set(right.sessions)
+    shared = [session for session in left.sessions if session in right_sessions]
+    if len(shared) < 3:
+        return None
+    left_closes = left.frame.loc[shared, "close"].to_numpy(dtype=float)
+    right_closes = right.frame.loc[shared, "close"].to_numpy(dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.diff(np.log(left_closes)), np.diff(np.log(right_closes))
 
 
 def expected_bar_panel(

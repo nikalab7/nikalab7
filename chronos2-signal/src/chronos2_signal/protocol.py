@@ -232,6 +232,9 @@ class ProtocolSchedule:
     folds: tuple[Fold, ...]
     refit_points: tuple[RefitPoint, ...]
     notes: tuple[str, ...] = ()
+    #: Origins between development and the final test that belong to neither.
+    #: Their outcome windows would otherwise overlap the first test origins'.
+    purged_before_test: tuple[dt.date, ...] = ()
 
     @property
     def labelled_origins(self) -> tuple[dt.date, ...]:
@@ -251,6 +254,7 @@ class ProtocolSchedule:
         return {
             "labelled_origins": len(self.timings),
             "development_origins": len(self.development_origins),
+            "purged_before_test": len(self.purged_before_test),
             "test_origins": len(self.test_origins),
             "folds": [fold.describe() for fold in self.folds],
             "refit_points": [point.describe() for point in self.refit_points],
@@ -288,11 +292,13 @@ def build_schedule(
     notes: list[str] = []
 
     reserved_count = validation.final_historical_test_origin_sessions
-    if len(origins) <= reserved_count:
+    purge = validation.purge_sessions_per_boundary
+    if len(origins) <= reserved_count + purge:
         message = (
             f"{len(origins)} labelled post-checkpoint origins is not more than the "
-            f"{reserved_count} reserved for the final test; there is no development "
-            "history yet. Stay in research and collect more dates."
+            f"{reserved_count} reserved for the final test plus the {purge}-session "
+            "purge before it; there is no development history yet. Stay in research "
+            "and collect more dates."
         )
         if require_folds:
             raise InsufficientHistory(message)
@@ -306,8 +312,14 @@ def build_schedule(
             notes=tuple(notes),
         )
 
-    development = origins[:-reserved_count]
+    # The development/test boundary is purged exactly like a fold boundary. The
+    # last development origins' outcome windows run two sessions past them; left
+    # in place, they would reach into the first test origins' holding windows
+    # and let development selection read part of a reserved outcome.
     test = origins[-reserved_count:]
+    purged_before_test = origins[-(reserved_count + purge) : -reserved_count]
+    development = origins[: -(reserved_count + purge)]
+    _assert_development_precedes_test(calendar, config, development, test)
 
     folds = _build_folds(calendar, config, development)
     if not folds:
@@ -338,7 +350,33 @@ def build_schedule(
         folds=tuple(folds),
         refit_points=tuple(refit_points),
         notes=tuple(notes),
+        purged_before_test=tuple(purged_before_test),
     )
+
+
+def _assert_development_precedes_test(
+    calendar: ExchangeCalendar,
+    config: DesignConfig,
+    development: Sequence[dt.date],
+    test: Sequence[dt.date],
+) -> None:
+    """Verify no development outcome window reaches the first test origin.
+
+    The same timestamp check the folds get, applied at the boundary that
+    matters most: a leak here would contaminate the one evaluation that is
+    supposed to be clean.
+    """
+    if not development or not test:
+        return
+    last = label_available_at(
+        calendar, development[-1], horizon_sessions=config.model.horizon_sessions
+    )
+    if last.exit_session >= test[0]:
+        raise ProtocolError(
+            f"development origin {development[-1].isoformat()} exits on "
+            f"{last.exit_session.isoformat()}, which reaches the first test origin "
+            f"{test[0].isoformat()}; the purge before the final test is too short"
+        )
 
 
 def _build_folds(
