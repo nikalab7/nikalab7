@@ -842,7 +842,9 @@ def test_invariant_10_duplicate_runs_and_failed_data(tmp_path, config, calendar)
         snapshot_hash="snap-1",
         generated_at=now,
     )
-    # Re-recording the identical forecast is a no-op, so retries are safe.
+    # Re-recording the identical forecast is a no-op, so retries are safe. A
+    # retry runs later, so its generation time differs; that must not count as
+    # a conflicting revision.
     ledger.record_forecast(
         cache_key="cache-1",
         symbol="AAA",
@@ -860,7 +862,7 @@ def test_invariant_10_duplicate_runs_and_failed_data(tmp_path, config, calendar)
         status="ok",
         diagnostics={},
         snapshot_hash="snap-1",
-        generated_at=now,
+        generated_at=now + dt.timedelta(minutes=5),
     )
     with pytest.raises(StorageError):
         ledger.record_forecast(

@@ -32,6 +32,8 @@ from chronos2_signal.holdout import AccessMode, HoldoutViolation
 from chronos2_signal.market import DailyPanel, aligned_log_returns
 from chronos2_signal.notifier import Notifier, RecordingChannel
 from chronos2_signal.operations import (
+    OperationsError,
+    _verify_holdout,
     render_comparison_markdown,
     run_after_close,
     run_development_comparison,
@@ -403,6 +405,12 @@ def test_studies_verify_the_holdout_instead_of_asserting_it(
     assert any(
         note.startswith("holdout verified: 0 of the 10 reserved") for note in study.notes
     ), study.notes
+
+    # The note is the result of a check that can fail: a development run that
+    # had touched a reserved origin is rejected, not reported as clean.
+    touched = {("C256", schedule.test_origins[0]): None}
+    with pytest.raises(OperationsError, match="reserved origin"):
+        _verify_holdout(schedule, touched, [], mode=AccessMode.DEVELOPMENT)
 
 
 # --------------------------------------------------------------------------- #

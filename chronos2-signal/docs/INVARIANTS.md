@@ -69,6 +69,14 @@ mutation was itself wrong — it added an early scoring call rather than moving 
 existing one, so the selector's last observation was still correct and the test passed.
 Only a faithful mutation shows whether a test catches anything.
 
+That first pass also covered only about half of the tests, although this section
+already claimed all of them. A second pass reintroduced a defect for every remaining
+test — eighteen mutations, all caught — and found two tests that could not fail
+against the defect they were credited with: the holdout check tested only the
+wording of its note, and the forecast-retry check reused the original timestamp. Both
+were strengthened, and the old versions were confirmed to pass under the mutation that
+the new ones catch.
+
 ## Defects the tests caught
 
 Recorded because a test suite is only credible if it has actually rejected something.
@@ -98,7 +106,9 @@ Found while wiring the components in, 30 September 2026:
    (`test_two_task_batch_is_not_read_as_quantiles_and_mean`)
 6. **Re-recording an identical forecast raised.** Its idempotency check compared the
    generation timestamp, which always differs between runs, so the documented no-op
-   retry was impossible. (`test_forecasts_are_written_to_the_ledger_at_batch_time`)
+   retry was impossible. Invariant 10's test passed regardless because its "retry"
+   reused the original timestamp; it now retries later, as a real retry does.
+   (`test_invariant_10_duplicate_runs_and_failed_data`)
 7. **The development/test boundary was not purged.** The last development origins'
    outcome windows reached into the first test origins' holding windows, so development
    selection could see part of a reserved outcome. (`test_the_dev_test_boundary_is_purged`)
