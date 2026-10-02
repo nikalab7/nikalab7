@@ -492,6 +492,7 @@ def build_daily_features(
     peer_daily: Mapping[str, DailyPanel],
     config_sigma_window: int = 20,
     config_sigma_floor: float = 0.005,
+    calendar: ExchangeCalendar | None = None,
 ) -> DailyFeatures:
     """Build the fourteen non-forecast features from completed daily sessions.
 
@@ -499,13 +500,36 @@ def build_daily_features(
     sector, including the symbol itself. Breadth is watchlist breadth, not
     whole-market breadth, and is masked when fewer than three peers are
     eligible.
+
+    With ``calendar``, every panel is first laid on the exchange's session
+    list, so that each window counts sessions rather than delivered rows. In
+    every case the origin's own daily bar is required for the stock, the market
+    proxy and the sector: without it the features would quietly describe the
+    previous session while the hourly channels describe this one.
     """
+    if calendar is not None:
+
+        def on_exchange_sessions(panel: DailyPanel) -> DailyPanel:
+            history = panel.up_to(origin_session)
+            if not len(history):
+                return history
+            return history.on_sessions(calendar.sessions(history.sessions[0], origin_session))
+
+        stock_daily = on_exchange_sessions(stock_daily)
+        market_daily = on_exchange_sessions(market_daily)
+        sector_daily = on_exchange_sessions(sector_daily)
+        peer_daily = {name: on_exchange_sessions(panel) for name, panel in peer_daily.items()}
+
     stock = stock_daily.up_to(origin_session)
     market = market_daily.up_to(origin_session)
     sector = sector_daily.up_to(origin_session)
 
     values: dict[str, float] = {}
     invalid: list[str] = []
+    for label, panel in (("stock", stock), ("market", market), ("sector", sector)):
+        closes = panel.column("close") if len(panel) else np.zeros(0)
+        if not len(panel) or panel.sessions[-1] != origin_session or not math.isfinite(closes[-1]):
+            invalid.append(f"daily_row_missing_on_origin:{label}")
 
     scale = sigma_2d(
         stock_daily, origin_session, window=config_sigma_window, floor=config_sigma_floor

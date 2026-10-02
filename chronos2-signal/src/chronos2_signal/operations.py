@@ -25,6 +25,7 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import json
+import math
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -65,8 +66,15 @@ from .simulation import (
     open_position_views,
     score_origin,
 )
+from .sources import SourceError
 from .storage import Ledger
-from .variants import REGISTERED_VARIANTS, cash_series, exposure_matched_series, variant_spec
+from .variants import (
+    REGISTERED_VARIANTS,
+    MarketLeg,
+    cash_series,
+    exposure_matched_series,
+    variant_spec,
+)
 
 __all__ = [
     "OperationsError",
@@ -382,7 +390,11 @@ def _refit_schedule(
             variant,
             fit_sessions=point.fit_sessions,
             calibration_sessions=point.calibration_sessions,
-            fit_deadline=deadline,
+            # The fold recipe: fitting runs when calibration begins, so a fit
+            # label not yet observable then is dropped rather than shared.
+            fit_deadline=(
+                point.fit_deadline.to_pydatetime() if point.fit_deadline is not None else deadline
+            ),
             calibration_deadline=deadline,
             batch_cache=cache,
         )
@@ -417,35 +429,113 @@ def _label_predictions(
     return labelled
 
 
-def _market_returns(pipeline: ResearchPipeline, sessions: Sequence[dt.date]) -> list[float]:
-    """Daily market-proxy returns on exactly ``sessions``, from one view.
-
-    One view at the last session gives one consistently restated series; a
-    return stitched from several views could straddle a restatement.
-    """
-    panel = pipeline.source.view(sessions[-1]).daily_panel(pipeline.market_proxy or "SPY")
-    returns: list[float] = []
-    previous: float | None = None
+def _open_and_close(view: Any, symbol: str, sessions: Sequence[dt.date]) -> tuple[dict, dict]:
+    """Official opens and closes of ``symbol`` on ``sessions``, where observed."""
+    opens: dict[dt.date, float] = {}
+    closes: dict[dt.date, float] = {}
+    try:
+        panel = view.daily_panel(symbol)
+    except (MarketDataError, SourceError):
+        return opens, closes
     for session in sessions:
         try:
-            close = float(panel.row(session)["close"])
+            row = panel.row(session)
         except MarketDataError:
-            returns.append(0.0)
             continue
-        returns.append(0.0 if previous is None else close / previous - 1.0)
-        previous = close
-    return returns
+        for column, target in (("open", opens), ("close", closes)):
+            value = float(row[column])
+            if math.isfinite(value) and value > 0.0:
+                target[session] = value
+    return opens, closes
 
 
 def _matched_series(
     pipeline: ResearchPipeline, result: BacktestResult, name: str
 ) -> DailySeries:
+    """The exposure-matched market benchmark for ``result``.
+
+    Every price comes from one view at the last session, so the benchmark and
+    the position values share one consistently restated series; a return
+    stitched from several views could straddle a restatement.
+    """
+    sessions = list(result.daily.sessions)
+    view = pipeline.source.view(sessions[-1])
+    market_open, market_close = _open_and_close(view, pipeline.market_proxy or "SPY", sessions)
+    days = result.portfolio.days
+    initial = pipeline.config.portfolio.initial_equity
+    equity_before = {
+        session: (days[position - 1].equity if position else initial)
+        for position, session in enumerate(sessions)
+    }
+    legs: list[MarketLeg] = []
+    book = result.portfolio
+    for held_position in (*book.closed, *book.positions):
+        last = held_position.exit_session or held_position.planned_exit_session
+        held = [s for s in sessions if held_position.entry_session <= s <= last]
+        if not held:
+            continue
+        stock_open, stock_close = _open_and_close(view, held_position.symbol, held)
+        legs.append(MarketLeg(session=held[0], notional=held_position.cost_basis, from_open=True))
+        # The market value at each previous close, from price ratios inside this
+        # one view -- unit-free, so a split during or after the hold cannot
+        # distort it. Without the prices, the committed capital stands in.
+        entry_open = stock_open.get(held_position.entry_session)
+        fill_premium = held_position.entry_fill_price / held_position.entry_reference_price
+        for previous, session in zip(held[:-1], held[1:], strict=True):
+            close = stock_close.get(previous)
+            notional = (
+                held_position.cost_basis / fill_premium * close / entry_open
+                if entry_open and close
+                else held_position.cost_basis
+            )
+            legs.append(MarketLeg(session=session, notional=notional, from_open=False))
     return exposure_matched_series(
         name=name,
-        sessions=result.daily.sessions,
-        market_returns=_market_returns(pipeline, result.daily.sessions),
-        candidate_gross_exposure=[day.gross_exposure for day in result.portfolio.days],
+        sessions=sessions,
+        legs=legs,
+        equity_before=equity_before,
+        market_open=market_open,
+        market_close=market_close,
     )
+
+
+def _block_sensitivity(
+    series: Sequence[DailySeries],
+    *,
+    config: DesignConfig,
+    samples: int,
+    confidence: float,
+    differences: Sequence[tuple[str, str]],
+) -> dict[int, dict[str, BootstrapEstimate]]:
+    """The same paired bootstrap at each registered sensitivity block length.
+
+    Section 14 registers block length 10 "with 5/20-session sensitivity". These
+    intervals are reported beside the primary ones and never replace them: a
+    gate reads only the registered block length.
+    """
+    return {
+        block: paired_block_bootstrap(
+            series,
+            block_sessions=block,
+            samples=samples,
+            confidence=confidence,
+            differences=differences,
+        )
+        for block in config.validation.bootstrap_block_sensitivity
+    }
+
+
+def _sensitivity_dict(sensitivity: Mapping[int, Mapping[str, BootstrapEstimate]]) -> dict[str, object]:
+    return {
+        "note": (
+            "block-length sensitivity (section 14); reported beside the registered "
+            "block length, never used by a gate"
+        ),
+        "blocks": {
+            str(block): {name: estimate.to_dict() for name, estimate in estimates.items()}
+            for block, estimates in sorted(sensitivity.items())
+        },
+    }
 
 
 def _verify_holdout(
@@ -522,6 +612,9 @@ class ComparisonResult:
     selection: SelectionDecision
     manifest: ReleaseManifest
     notes: tuple[str, ...] = ()
+    bootstrap_sensitivity: Mapping[int, Mapping[str, BootstrapEstimate]] = field(
+        default_factory=dict
+    )
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -537,6 +630,7 @@ class ComparisonResult:
                 for name, series in self.controls.items()
             },
             "bootstrap": {name: estimate.to_dict() for name, estimate in self.bootstrap.items()},
+            "bootstrap_block_sensitivity": _sensitivity_dict(self.bootstrap_sensitivity),
             "predictive": {name: report.to_dict() for name, report in self.predictive.items()},
             "selection": self.selection.to_dict(),
             "release_manifest": self.manifest.to_dict(),
@@ -564,11 +658,13 @@ def select_candidate(
        of executed trades across the registered number of distinct sessions,
        positive mean net return at base *and* stress costs, and profit that
        survives removing the single best trade.
-    2. Eligible candidates are ranked by the lower bound of their mean daily
+    2. Eligible candidates are ranked by the 90% lower bound of their mean daily
        reference-portfolio net return.
-    3. No winner is declared unless the leader's lower bound is above zero and
-       it is distinguishable from the runner-up. Otherwise C256 is retained for
-       continued research without being declared superior.
+    3. If the difference between the leader and the runner-up is inconclusive,
+       there is no winner and C256 is retained for continued research without
+       being declared superior. Section 12 sets no further condition on the
+       leader's own lower bound: whether its return is credibly positive is the
+       final test's question, not the selection's.
     4. A Transformer edge is claimable only if the winner also beats B0.
     """
     validation = config.validation
@@ -624,12 +720,7 @@ def select_candidate(
 
     if not eligible:
         return no_winner("No Chronos candidate met the development floors.")
-    leader, leader_lower = ranking[0]
-    if not leader_lower > 0.0:
-        return no_winner(
-            f"The best eligible candidate, {leader}, has a {confidence} lower bound of "
-            f"{leader_lower:.6g}, which is not above zero."
-        )
+    leader = ranking[0][0]
     if len(ranking) > 1:
         runner_up = ranking[1][0]
         gap = bootstrap.get(f"{leader}_minus_{runner_up}")
@@ -723,9 +814,17 @@ def run_development_comparison(
             differences.append((name, "B0"))
     differences += [(a, b) for a in candidates for b in candidates if a != b]
 
+    compared = [*(result.daily for result in systems.values()), *controls.values()]
     bootstrap = paired_block_bootstrap(
-        [*(result.daily for result in systems.values()), *controls.values()],
+        compared,
         block_sessions=config.validation.bootstrap_block_sessions,
+        samples=bootstrap_samples or config.validation.bootstrap_samples,
+        confidence=config.validation.development_selection_bootstrap_confidence,
+        differences=differences,
+    )
+    sensitivity = _block_sensitivity(
+        compared,
+        config=config,
         samples=bootstrap_samples or config.validation.bootstrap_samples,
         confidence=config.validation.development_selection_bootstrap_confidence,
         differences=differences,
@@ -757,6 +856,7 @@ def run_development_comparison(
         predictive=predictive,
         selection=selection,
         manifest=manifest,
+        bootstrap_sensitivity=sensitivity,
         notes=(
             *notes,
             *_forecaster_notes(systems.values()),
@@ -789,6 +889,9 @@ class StudyResult:
     manifest: ReleaseManifest
     folds: tuple[Fold, ...] = ()
     notes: tuple[str, ...] = field(default_factory=tuple)
+    bootstrap_sensitivity: Mapping[int, Mapping[str, BootstrapEstimate]] = field(
+        default_factory=dict
+    )
 
     def to_dict(self) -> dict[str, object]:
         metrics = trade_metrics(
@@ -801,6 +904,7 @@ class StudyResult:
             "candidate": self.candidate.summary(),
             "baseline": self.baseline.summary() if self.baseline else None,
             "trade_metrics": metrics.to_dict(),
+            "alert_coverage": _alert_coverage(self.candidate),
             "controls": {
                 name: {"mean_daily_return": series.mean, "sessions": len(series)}
                 for name, series in self.controls.items()
@@ -808,6 +912,7 @@ class StudyResult:
             "bootstrap": {
                 name: estimate.to_dict() for name, estimate in self.bootstrap.items()
             },
+            "bootstrap_block_sensitivity": _sensitivity_dict(self.bootstrap_sensitivity),
             "predictive": self.predictive.to_dict(),
             "block_profitability": block_profitability(
                 self.candidate.daily, block_sessions=20
@@ -871,6 +976,13 @@ def _assemble_study(
         confidence=config.validation.promotion_bootstrap_confidence,
         differences=differences,
     )
+    sensitivity = _block_sensitivity(
+        systems,
+        config=config,
+        samples=bootstrap_samples or config.validation.bootstrap_samples,
+        confidence=config.validation.promotion_bootstrap_confidence,
+        differences=differences,
+    )
     predictive = predictive_report(
         _label_predictions(pipeline, candidate.predictions),
         quantile_levels=config.model.quantile_levels,
@@ -921,6 +1033,7 @@ def _assemble_study(
         gates=gates,
         manifest=manifest,
         folds=tuple(folds),
+        bootstrap_sensitivity=sensitivity,
         notes=(
             # The caller's notes lead: a warning about what the data is belongs
             # at the top of what a reader looks at, not only in the manifest.
@@ -1113,8 +1226,10 @@ def render_markdown(result: StudyResult) -> str:
         "## Coverage",
         "",
         f"- Origins scanned: {metrics.origins_scanned}",
-        f"- Origins with alerts: {metrics.origins_with_alerts}",
-        f"- Origins with no alert: {metrics.no_alert_origins}",
+        f"- Origins with alerts: "
+        f"{result.candidate.origins_scanned - len(result.candidate.no_alert_origins)}",
+        f"- Origins with no alert: {len(result.candidate.no_alert_origins)}",
+        f"- Origins with an executed trade: {metrics.origins_with_trades}",
         f"- Executed trades: {metrics.trades} "
         f"(unresolved exits: {metrics.unresolved_exits})",
         f"- Distinct signal sessions: {metrics.distinct_sessions}",
@@ -1163,6 +1278,15 @@ def render_markdown(result: StudyResult) -> str:
             f"over {estimate.n_sessions} sessions, "
             f"block {estimate.block_sessions}"
         )
+    if result.bootstrap_sensitivity:
+        lines.extend(["", "## Block-length sensitivity (reported, not gated)", ""])
+        for block, estimates in sorted(result.bootstrap_sensitivity.items()):
+            own = estimates.get(result.variant)
+            if own is not None:
+                lines.append(
+                    f"- block {block}: {result.variant} "
+                    f"[{_fmt(own.lower)}, {_fmt(own.upper)}] at {own.confidence:.0%}"
+                )
     lines.extend(["", "## Promotion gates", ""])
     for gate in result.gates.results:
         mark = "PASS" if gate.passed else "FAIL"
@@ -1212,6 +1336,17 @@ def render_comparison_markdown(result: ComparisonResult) -> str:
     lines.extend(["", "## Notes", ""])
     lines.extend(f"- {note}" for note in result.notes)
     return "\n".join(lines) + "\n"
+
+
+def _alert_coverage(result: BacktestResult) -> dict[str, float | int]:
+    """Section 14's alert coverage, from the selector's own record of alerts."""
+    with_alerts = result.origins_scanned - len(result.no_alert_origins)
+    return {
+        "origins_scanned": result.origins_scanned,
+        "origins_with_alerts": with_alerts,
+        "no_alert_origins": len(result.no_alert_origins),
+        "alert_coverage": (with_alerts / result.origins_scanned) if result.origins_scanned else float("nan"),
+    }
 
 
 def _fmt(value: object) -> str:

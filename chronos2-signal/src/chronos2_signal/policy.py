@@ -30,6 +30,7 @@ __all__ = [
     "AlertDecision",
     "PolicyOutcome",
     "PolicyEngine",
+    "correlation_block",
     "dedup_key",
 ]
 
@@ -144,6 +145,41 @@ class PolicyOutcome:
 #: required history is missing, which blocks the allocation rather than
 #: defaulting to "uncorrelated".
 CorrelationLookup = Callable[[str, str], float | None]
+
+
+def correlation_block(
+    symbol: str,
+    others: Sequence[str],
+    correlation: CorrelationLookup | None,
+    *,
+    config: DesignConfig,
+) -> str | None:
+    """Why the correlation cap blocks adding ``symbol`` next to ``others``, if it does.
+
+    One rule for every system that allocates -- the candidates and the fixed
+    momentum control alike. A pair above the registered cap is not added, and
+    missing history blocks the allocation: treating an unmeasurable pair as
+    uncorrelated would quietly defeat the cap.
+    """
+    cap = config.portfolio.pairwise_correlation_cap
+    if not others:
+        return None
+    if correlation is None:
+        return (
+            "correlation: no correlation source supplied; the allocation is blocked "
+            "rather than assumed uncorrelated"
+        )
+    for other in others:
+        value = correlation(symbol, other)
+        if value is None or not math.isfinite(value):
+            return (
+                f"correlation: missing trailing-"
+                f"{config.portfolio.correlation_window_sessions}-session history "
+                f"against {other}; allocation blocked"
+            )
+        if value > cap:
+            return f"correlation: {value:.3f} against {other} exceeds the {cap:.2f} cap"
+    return None
 
 
 @dataclass
@@ -346,30 +382,12 @@ class PolicyEngine:
         Missing history blocks the allocation. Treating an unmeasurable pair as
         uncorrelated would quietly defeat the cap.
         """
-        cap = self.config.portfolio.pairwise_correlation_cap
-        others = [item.symbol for item in accepted] + [
-            item.symbol for item in open_positions
-        ]
-        if not others:
-            return None
-        if correlation is None:
-            return (
-                "correlation: no correlation source supplied; the allocation is blocked "
-                "rather than assumed uncorrelated"
-            )
-        for other in others:
-            value = correlation(candidate.symbol, other)
-            if value is None or not math.isfinite(value):
-                return (
-                    f"correlation: missing trailing-"
-                    f"{self.config.portfolio.correlation_window_sessions}-session history "
-                    f"against {other}; allocation blocked"
-                )
-            if value > cap:
-                return (
-                    f"correlation: {value:.3f} against {other} exceeds the {cap:.2f} cap"
-                )
-        return None
+        return correlation_block(
+            candidate.symbol,
+            [item.symbol for item in accepted] + [item.symbol for item in open_positions],
+            correlation,
+            config=self.config,
+        )
 
     def signal_payload(
         self,

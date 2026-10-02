@@ -81,9 +81,12 @@ class TradeMetrics:
     trades: int
     distinct_sessions: int
     origins_scanned: int
-    origins_with_alerts: int
-    no_alert_origins: int
-    alert_coverage: float
+    #: Origins whose alerts became executed trades. Alert counts themselves come
+    #: from the selector (``BacktestResult.no_alert_origins``): an alert that
+    #: could not be filled is an alert without a trade.
+    origins_with_trades: int
+    origins_without_trades: int
+    trade_coverage: float
     win_rate: float
     mean_net_return: float
     median_net_return: float
@@ -100,9 +103,9 @@ class TradeMetrics:
             "trades": self.trades,
             "distinct_sessions": self.distinct_sessions,
             "origins_scanned": self.origins_scanned,
-            "origins_with_alerts": self.origins_with_alerts,
-            "no_alert_origins": self.no_alert_origins,
-            "alert_coverage": self.alert_coverage,
+            "origins_with_trades": self.origins_with_trades,
+            "origins_without_trades": self.origins_without_trades,
+            "trade_coverage": self.trade_coverage,
             "win_rate": self.win_rate,
             "mean_net_return": self.mean_net_return,
             "median_net_return": self.median_net_return,
@@ -168,9 +171,9 @@ def trade_metrics(
         trades=len(trades),
         distinct_sessions=len(sessions),
         origins_scanned=origins_scanned,
-        origins_with_alerts=len(sessions),
-        no_alert_origins=max(0, origins_scanned - len(sessions)),
-        alert_coverage=(len(sessions) / origins_scanned) if origins_scanned else float("nan"),
+        origins_with_trades=len(sessions),
+        origins_without_trades=max(0, origins_scanned - len(sessions)),
+        trade_coverage=(len(sessions) / origins_scanned) if origins_scanned else float("nan"),
         win_rate=win_rate,
         mean_net_return=float(returns.mean()) if returns.size else float("nan"),
         median_net_return=float(np.median(returns)) if returns.size else float("nan"),
@@ -681,9 +684,11 @@ def block_profitability(
     """Consecutive non-overlapping evaluation blocks and their total return.
 
     A result carried by one lucky stretch shows up here as a single profitable
-    block among several losing ones.
+    block among several losing ones. A trailing block shorter than
+    ``block_sessions`` is reported with ``complete`` false: it is shown, but it
+    is not one of the registered blocks a gate may count.
     """
-    rows: list[dict[str, float | str]] = []
+    rows: list[dict[str, float | str | bool]] = []
     for start in range(0, len(series), block_sessions):
         window = series.returns[start : start + block_sessions]
         if window.size == 0:
@@ -694,6 +699,7 @@ def block_profitability(
                 "first_session": series.sessions[start].isoformat(),
                 "last_session": series.sessions[min(start + window.size, len(series)) - 1].isoformat(),
                 "sessions": float(window.size),
+                "complete": bool(window.size == block_sessions),
                 "total_return": total,
                 "mean_daily_return": float(window.mean()),
             }
@@ -708,24 +714,38 @@ def contributor_concentration(
 
     If a single issuer or sector explains almost everything, the claim is
     restricted to that contributor rather than generalised to the watchlist.
+
+    Only trades with a known outcome enter the shares and the best-trade check;
+    unresolved ones are counted and reported. Letting a ``NaN`` take part would
+    make it the "best trade" (``argmax`` returns a NaN's position), so that the
+    real best trade was never removed.
     """
-    if not trades:
-        return {"total": 0.0, "top_key": None, "top_share": float("nan"), "by_key": {}}
+    known = [trade for trade in trades if math.isfinite(trade.r_net_base)]
+    unresolved = len(trades) - len(known)
+    if not known:
+        return {
+            "total": 0.0,
+            "top_key": None,
+            "top_share": float("nan"),
+            "by_key": {},
+            "sum_excluding_best_trade": float("nan"),
+            "profitable_excluding_best_trade": False,
+            "unresolved": unresolved,
+        }
     totals: dict[str, float] = {}
-    for trade in trades:
+    for trade in known:
         label = getattr(trade, key)
         totals[label] = totals.get(label, 0.0) + trade.r_net_base
     total = sum(totals.values())
-    top_key = max(totals, key=lambda name: totals[name]) if totals else None
-    top_share = (
-        totals[top_key] / total
-        if top_key is not None and total != 0.0
-        else float("nan")
-    )
-    returns = np.asarray([trade.r_net_base for trade in trades], dtype=float)
-    best_index = int(np.argmax(returns)) if returns.size else -1
+    top_key = max(totals, key=lambda name: totals[name])
+    # A share is only meaningful as a share of a profit: with a net loss there
+    # is nothing to attribute.
+    top_share = totals[top_key] / total if total > 0.0 else float("nan")
+    returns = np.asarray([trade.r_net_base for trade in known], dtype=float)
     without_best = (
-        float(np.sum(np.delete(returns, best_index))) if returns.size > 1 else float("nan")
+        float(np.sum(np.delete(returns, int(np.argmax(returns)))))
+        if returns.size > 1
+        else float("nan")
     )
     return {
         "total": total,
@@ -736,6 +756,7 @@ def contributor_concentration(
         "profitable_excluding_best_trade": (
             bool(without_best > 0.0) if math.isfinite(without_best) else False
         ),
+        "unresolved": unresolved,
     }
 
 
@@ -938,7 +959,9 @@ def evaluate_promotion_gates(
     )
 
     blocks = block_profitability(portfolio_series, block_sessions=config_block_sessions)
-    profitable_blocks = [row for row in blocks if float(row["total_return"]) > 0.0]
+    full_blocks = [row for row in blocks if row["complete"]]
+    profitable_blocks = [row for row in full_blocks if float(row["total_return"]) > 0.0]
+    partial = [row for row in blocks if not row["complete"]]
     concentration = contributor_concentration(combined, key="issuer_id")
     robust_without_best = bool(concentration.get("profitable_excluding_best_trade"))
     results.append(
@@ -949,20 +972,40 @@ def evaluate_promotion_gates(
                 len(profitable_blocks) >= config_min_profitable_blocks and robust_without_best
             ),
             detail=(
-                f"{len(profitable_blocks)} of {len(blocks)} {config_block_sessions}-session "
-                f"blocks profitable; profitable without the single best trade: "
-                f"{robust_without_best}"
+                f"{len(profitable_blocks)} of {len(full_blocks)} full "
+                f"{config_block_sessions}-session blocks profitable"
+                + (
+                    f" (a trailing {int(float(partial[0]['sessions']))}-session block is "
+                    "not counted)"
+                    if partial
+                    else ""
+                )
+                + f"; profitable without the single best trade: {robust_without_best}"
+                + (
+                    f"; {concentration['unresolved']} unresolved trade(s) excluded"
+                    if concentration.get("unresolved")
+                    else ""
+                )
             ),
             evidence={"blocks": blocks},
         )
     )
 
     sector_concentration = contributor_concentration(combined, key="sector")
-    top_share = concentration.get("top_share")
-    measurable = isinstance(top_share, float) and math.isfinite(top_share)
-    concentrated = measurable and top_share > 0.5
-    # No trades means nothing to report with the strongest contributor removed,
-    # so the gate cannot pass. Gates fail closed on absent evidence.
+    shares = {
+        "issuer": (concentration.get("top_key"), concentration.get("top_share")),
+        "sector": (sector_concentration.get("top_key"), sector_concentration.get("top_share")),
+    }
+    measurable = all(
+        isinstance(share, float) and math.isfinite(share) for _key, share in shares.values()
+    )
+    concentrated = [
+        f"{kind} {key} explains {share:.1%}"
+        for kind, (key, share) in shares.items()
+        if measurable and share > 0.5
+    ]
+    # No trades, or no net profit, means nothing to attribute -- so the gate
+    # cannot pass. Gates fail closed on absent evidence.
     gate_six_passed = bool(
         combined
         and measurable
@@ -972,12 +1015,15 @@ def evaluate_promotion_gates(
         gate_six_detail = "no executed trades: concentration cannot be assessed"
     elif not measurable:
         gate_six_detail = (
-            "summed net return is zero, so no contributor share is measurable"
+            "summed net return is not positive, so there is no profit to attribute to "
+            "any contributor"
         )
     else:
         gate_six_detail = (
-            f"top issuer {concentration.get('top_key')} explains "
-            f"{top_share:.1%} of the summed net return"
+            "; ".join(
+                f"top {kind} {key} explains {share:.1%} of the summed net return"
+                for kind, (key, share) in shares.items()
+            )
             + (
                 "; a concentrated result must have its claim restricted rather than "
                 "generalised to the whole watchlist"

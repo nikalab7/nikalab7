@@ -198,12 +198,21 @@ class Fold:
 class RefitPoint:
     """One scheduled prequential refit.
 
+    The blocks follow the fold recipe exactly: fit, purge, calibration, purge,
+    then the scored origins.
+
     Attributes:
         effective_from: First origin scored by this fit.
         fit_sessions: Matured origins used for fitting.
+        purged_before_calibration: The gap between the fit and calibration
+            blocks, so that no fit outcome shares a holding session with a
+            calibration outcome.
         calibration_sessions: Matured origins used for calibration.
-        purged_sessions: Matured origins deliberately skipped as the gap.
-        deadline: The moment of the refit. Only labels observable by then enter.
+        purged_sessions: The gap between calibration and the scored origins.
+        fit_deadline: When the fitting stage runs: the first calibration
+            origin's signal time, as in the folds.
+        deadline: The moment of the refit, which is also the calibration
+            deadline. Only labels observable by then enter.
     """
 
     effective_from: dt.date
@@ -211,13 +220,17 @@ class RefitPoint:
     calibration_sessions: tuple[dt.date, ...]
     purged_sessions: tuple[dt.date, ...]
     deadline: pd.Timestamp
+    purged_before_calibration: tuple[dt.date, ...] = ()
+    fit_deadline: pd.Timestamp | None = None
 
     def describe(self) -> dict[str, object]:
         return {
             "effective_from": self.effective_from.isoformat(),
             "fit_sessions": len(self.fit_sessions),
+            "purged_before_calibration": len(self.purged_before_calibration),
             "calibration_sessions": len(self.calibration_sessions),
             "purged_sessions": len(self.purged_sessions),
+            "fit_deadline": self.fit_deadline.isoformat() if self.fit_deadline is not None else None,
             "deadline": self.deadline.isoformat(),
         }
 
@@ -494,24 +507,31 @@ def build_refit_point(
             calendar, origin, horizon_sessions=horizon
         ).matured_by(deadline)
     ]
-    purge = min(max(validation.purge_sessions_per_boundary, 0), len(matured))
+    purge = max(validation.purge_sessions_per_boundary, 0)
+    calibration_size = validation.calibration_origin_sessions
+    needed = validation.min_fit_origin_sessions + purge + calibration_size + purge
+    if len(matured) < needed:
+        raise InsufficientHistory(
+            f"refit effective {effective_from.isoformat()}: {len(matured)} matured "
+            f"origins, need {needed} for fit, purge, calibration and purge"
+        )
+    # Working back from the refit moment: purge, calibration, purge, fit.
     purged = tuple(matured[len(matured) - purge :]) if purge else ()
     usable = matured[: len(matured) - purge]
-
-    needed = validation.min_fit_origin_sessions + validation.calibration_origin_sessions
-    if len(usable) < needed:
-        raise InsufficientHistory(
-            f"refit effective {effective_from.isoformat()}: {len(usable)} matured "
-            f"origins after the purge, need {needed}"
-        )
-    calibration = tuple(usable[-validation.calibration_origin_sessions :])
-    fit = tuple(usable[: len(usable) - validation.calibration_origin_sessions])
+    calibration = tuple(usable[len(usable) - calibration_size :])
+    before_calibration = usable[: len(usable) - calibration_size]
+    purged_before_calibration = (
+        tuple(before_calibration[len(before_calibration) - purge :]) if purge else ()
+    )
+    fit = tuple(before_calibration[: len(before_calibration) - purge])
     return RefitPoint(
         effective_from=effective_from,
         fit_sessions=fit,
         calibration_sessions=calibration,
         purged_sessions=purged,
         deadline=deadline,
+        purged_before_calibration=purged_before_calibration,
+        fit_deadline=calendar.signal_time(calibration[0]),
     )
 
 

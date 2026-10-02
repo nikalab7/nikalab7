@@ -410,7 +410,12 @@ class ReferencePortfolio:
             position.exit_session = session
             position.exit_reference_price = price
             position.exit_fill_price = fill
-            position.proceeds = position.restated_shares * fill
+            # The explicit fee is a fraction of the entry notional, charged once
+            # per round trip -- exactly as the registered label charges it.
+            position.proceeds = (
+                position.restated_shares * fill
+                - self.costs.explicit_fee_fraction * position.cost_basis
+            )
             position.status = "closed"
             ledger = ledgers.get(position.symbol)
             if ledger is not None:

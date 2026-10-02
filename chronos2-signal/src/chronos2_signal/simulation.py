@@ -412,6 +412,8 @@ class MomentumSelector:
             open_sectors=book.sector_counts(),
             open_issuers=sorted(book.open_issuers()),
             open_position_count=len(book.positions),
+            open_symbols=[position.symbol for position in book.positions],
+            correlation=self.pipeline.correlation_lookup(session),
         )
         return SelectionOutcome(
             selections=tuple(
@@ -748,12 +750,14 @@ def _trade_record(
     config: DesignConfig, position: PaperPosition, ledger: ActionLedger | None
 ) -> TradeRecord:
     resolved = position.status == "closed"
-    scenarios: dict[str, float] = {
-        "base": position.realised_net_return() if resolved else float("nan")
-    }
-    for scenario in ("stress", "severe"):
+    scenarios: dict[str, float] = {}
+    for scenario in ("base", "stress", "severe"):
         if not resolved or position.exit_reference_price is None or position.exit_session is None:
             scenarios[scenario] = float("nan")
+            continue
+        if scenario == position.cost_scenario:
+            # The portfolio's own accounting, at the scenario it ran under.
+            scenarios[scenario] = position.realised_net_return()
             continue
         slippage = config.execution.slippage_fraction(scenario)
         account = label_net_return(
@@ -809,25 +813,37 @@ class WalkForwardRunner:
         batch_cache: BatchCache | None = None,
     ) -> DecisionModel:
         """Fit one model from labelled rows of the two blocks."""
-        fit_rows: list[OriginRow] = []
-        calibration_rows: list[OriginRow] = []
-        for sessions, sink in (
-            (fit_sessions, fit_rows),
-            (calibration_sessions, calibration_rows),
-        ):
-            for session in sessions:
-                batch = cached_batch(self.pipeline, variant, session, batch_cache)
-                sink.extend(
-                    self.pipeline.labelled_rows(batch, cost_scenario=self.cost_scenario)
-                )
         return fit_decision_model(
             variant=variant,
-            fit_rows=fit_rows,
-            calibration_rows=calibration_rows,
+            fit_rows=self.training_rows(variant, sessions=fit_sessions, batch_cache=batch_cache),
+            calibration_rows=self.training_rows(
+                variant, sessions=calibration_sessions, batch_cache=batch_cache
+            ),
             config=self.config,
             fit_deadline=fit_deadline,
             calibration_deadline=calibration_deadline,
         )
+
+    def training_rows(
+        self,
+        variant: str,
+        *,
+        sessions: Sequence[dt.date],
+        batch_cache: BatchCache | None = None,
+    ) -> list[OriginRow]:
+        """Labelled rows for fitting, always at base costs.
+
+        The decision heads are registered on base-cost labels: the minimum
+        estimate is a base-cost figure and the stress requirement reprices it.
+        Training on stress-cost labels would count the stress step twice, so the
+        runner's own cost scenario -- which governs the simulated fills -- does
+        not reach the labels.
+        """
+        rows: list[OriginRow] = []
+        for session in sessions:
+            batch = cached_batch(self.pipeline, variant, session, batch_cache)
+            rows.extend(self.pipeline.labelled_rows(batch, cost_scenario="base"))
+        return rows
 
     def run(
         self,

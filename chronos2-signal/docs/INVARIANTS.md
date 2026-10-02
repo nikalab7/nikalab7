@@ -39,6 +39,10 @@ The tests verify behaviour; these are the places that make it true.
 | As-of units for screens | `actions.to_asof_units`, `quality.liquidity_metrics` |
 | Entry at the next open | `simulation.simulate`, `portfolio.ReferencePortfolio.allocate` |
 | One set of units per position | `simulation._unit_change`, `portfolio.ReferencePortfolio.restate_units` |
+| One universe mask for every variant | `pipeline.ResearchPipeline.panel_bars` — every variant loads the panel the longest registered context needs |
+| Daily windows count sessions | `features.build_daily_features(calendar=...)`, `market.DailyPanel.on_sessions`; the origin's daily bar is required |
+| No bar still forming at retrieval | `collector.Ingestor._persist_bars` |
+| Exposure-matched benchmark | `variants.exposure_matched_series`, `operations._matched_series` — the same capital over the same intervals, entry day included |
 | Scoring after the close | `simulation.simulate` — exits and the mark precede scoring |
 | Median naming, crossed quantiles | `forecaster.ForecastResult.forecast_median`, `forecaster.validate_quantile_paths` |
 | Output orientation and unpacking | `forecaster.Chronos2Forecaster._to_arrays`, `forecaster._orient_levels_by_horizon` |
@@ -132,3 +136,57 @@ the test below was written first and failed against the unfixed engine:
     explains leaves the position unpriced rather than valued in the wrong units.
     (`test_a_split_inside_a_hold_changes_units_not_value`,
     `test_a_requoted_entry_is_neither_a_split_nor_a_return`)
+
+Found by an independent review on 2 October 2026: three reviewers, each taking a group
+of the modules that determine results, every finding then reproduced before it was
+accepted. Each fix has a test that failed before it.
+
+11. **Refits skipped the purge between fit and calibration.** In the final test, the
+    last fit origin and the first calibration origin shared a holding session; the
+    folds had the registered two-session gap. Refits now use the fold recipe
+    exactly, including its fit deadline.
+    (`test_refits_follow_the_fold_recipe_including_both_purges`)
+12. **The exposure-matched benchmark missed every entry day.** It applied the previous
+    close's exposure, but a D1 entry is decided at D0's after-close run and is known
+    in advance. A zero-skill strategy that simply bought SPY showed excess return over
+    "the same exposure" on 17 of 35 sessions.
+    (`test_holding_the_market_shows_no_excess_over_the_matched_benchmark`)
+13. **C512 could see a different universe.** It loaded more history than the other
+    variants, so an unresolvable split in that extra stretch removed the stock for
+    C512 alone. (`test_every_variant_shares_one_universe_mask`)
+14. **A missing origin-day daily bar was replaced by yesterday's**, and windows
+    counted rows: one missing day turned a five-session return into a six-session
+    one. (`test_a_missing_origin_daily_row_is_not_replaced_by_yesterday`,
+    `test_trailing_returns_count_sessions_not_rows`)
+15. **Gate 5 counted a two-session tail as one of the three 20-session blocks.**
+    (`test_gate_five_counts_only_full_twenty_session_blocks`)
+16. **An unresolved trade stood in for the best trade.** `argmax` returns a NaN's
+    position, so the real best trade was never removed in the outlier check.
+    (`test_an_unresolved_trade_does_not_stand_in_for_the_best_one`)
+17. **Gate 6 ignored sector concentration** and passed a net loss as "not
+    concentrated". (`test_gate_six_restricts_a_claim_explained_by_one_sector`)
+18. **The selection rule had a condition section 12 does not contain** — a positive
+    lower bound for the leader — so a candidate conclusively better than C256 could
+    still be passed over. (`test_selection_follows_the_registered_rule`)
+19. **The momentum control ignored the correlation cap**, one of "the same capacity
+    rules". Both systems now use one function.
+    (`test_momentum_control_respects_the_same_capacity_rules`)
+20. **The registered 5/20-session bootstrap sensitivity was never computed.**
+    (`test_studies_report_the_registered_block_length_sensitivity`)
+21. **A bar still forming at retrieval was stored as complete**, so a pre-close fetch
+    could feed a partial bar to the model as finished.
+    (`test_a_bar_still_in_progress_at_retrieval_is_not_stored`)
+22. **Calendar answers depended on the order of earlier lookups.**
+    (`test_calendar_answers_do_not_depend_on_lookup_order`)
+
+Latent — unreachable by any current caller, fixed so they cannot become live:
+
+23. A training label without an availability time passed the leakage check.
+    (`test_a_label_without_an_availability_time_is_dropped_under_a_deadline`)
+24. An explicit broker fee was never charged by the portfolio.
+    (`test_an_explicit_fee_is_charged_exactly_as_the_label_charges_it`)
+25. A stress-cost run trained on stress labels, counting the stress step twice, and
+    recorded its stress return as the base return.
+    (`test_a_stress_cost_run_still_records_each_trade_at_every_cost_level`)
+26. "Alert coverage" counted executed trades; alerts now come from the selector's
+    own record.

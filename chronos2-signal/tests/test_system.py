@@ -33,6 +33,7 @@ from chronos2_signal.market import DailyPanel, aligned_log_returns
 from chronos2_signal.notifier import Notifier, RecordingChannel
 from chronos2_signal.operations import (
     OperationsError,
+    _matched_series,
     _verify_holdout,
     render_comparison_markdown,
     run_after_close,
@@ -215,6 +216,88 @@ def test_unresolvable_split_quarantines_the_origin_and_the_label(
     assert pipeline.label(calendar.next_session(SPLIT_IN_WINDOW, 2), "AAA") is not None
 
 
+def test_every_variant_shares_one_universe_mask(
+    calendar, config, synthetic_spec, watchlist, stub_forecaster
+):
+    """Section 12: all variants share one mask, whatever context length they read.
+
+    C512 reads further back than the others. An unresolvable split in that extra
+    stretch once quarantined the stock for C512 alone, so the variants were
+    compared on different universes.
+    """
+    long_window = calendar.bars_ending_at(ORIGIN, recommended_panel_bars(512))
+    common_start = calendar.bars_ending_at(
+        ORIGIN, config.universe.common_hourly_history_bars
+    )[0].session
+    stretch = sorted({bar.session for bar in long_window if bar.session < common_start})
+    assert len(stretch) > 5
+    ex_date = stretch[len(stretch) // 2]
+    market = _market_with(
+        calendar,
+        synthetic_spec,
+        actions={"AAA": (_split(ex_date),)},
+        emitted_price_jumps={"AAA": ((ex_date, 1.5),)},  # ambiguous: quarantined
+    )
+    pipeline = _pipeline(config, calendar, market, watchlist, stub_forecaster)
+    eligible = {
+        variant: next(
+            score for score in pipeline.build_batch(ORIGIN, variant).scores if score.symbol == "AAA"
+        ).eligibility.eligible
+        for variant in ("B0", "C128", "C256", "C512", "U256")
+    }
+    assert len(set(eligible.values())) == 1, eligible
+
+
+@dataclasses.dataclass
+class _MissingDailyRows:
+    """Serves ``inner`` with some of one symbol's daily rows withheld."""
+
+    inner: FixtureMarketSource
+    symbol: str
+    missing: tuple[dt.date, ...]
+
+    def view(self, session):
+        return _WithheldView(self.inner.view(session), self)
+
+    def describe(self):
+        return self.inner.describe()
+
+
+class _WithheldView:
+    def __init__(self, view, spec):
+        self._view, self._spec = view, spec
+        self.session = view.session
+
+    def __getattr__(self, name):
+        return getattr(self._view, name)
+
+    def daily_panel(self, symbol):
+        panel = self._view.daily_panel(symbol)
+        if symbol != self._spec.symbol:
+            return panel
+        frame = panel.frame.drop(index=[s for s in self._spec.missing if s in panel.frame.index])
+        return DailyPanel(symbol=panel.symbol, frame=frame, snapshot_hash=panel.snapshot_hash)
+
+
+def test_a_missing_origin_daily_row_is_not_replaced_by_yesterday(calendar, pipeline):
+    """Daily features need the origin's own daily bar; the previous one is not a stand-in."""
+    withheld = dataclasses.replace(pipeline, source=_MissingDailyRows(pipeline.source, "AAA", (ORIGIN,)))
+    aaa = next(score for score in withheld.build_batch(ORIGIN, "B0").scores if score.symbol == "AAA")
+    assert not aaa.scorable
+    assert "daily_row_missing_on_origin" in (aaa.skip_reason or "")
+
+
+def test_trailing_returns_count_sessions_not_rows(calendar, pipeline):
+    """A missing interior day must not stretch a five-session return to six."""
+    gap = calendar.previous_sessions(ORIGIN, 3)[0]
+    withheld = dataclasses.replace(pipeline, source=_MissingDailyRows(pipeline.source, "AAA", (gap,)))
+    aaa = next(score for score in withheld.build_batch(ORIGIN, "B0").scores if score.symbol == "AAA")
+    full = pipeline.source.view(ORIGIN).daily_panel("AAA")
+    five_back = calendar.previous_sessions(ORIGIN, 5)[0]
+    expected = float(full.row(ORIGIN)["close"]) / float(full.row(five_back)["close"]) - 1.0
+    assert aaa.features["f08_stock_return_5s"] == pytest.approx(expected, rel=1e-12)
+
+
 def test_split_outside_the_feature_window_does_not_quarantine(
     calendar, config, synthetic_spec, watchlist, stub_forecaster
 ):
@@ -292,6 +375,37 @@ def test_ledger_source_reproduces_the_fixture_through_the_pipeline(
             ), f"{fixture_score.symbol}.{name}"
     # The report says which vintage it was read at, and what that implies.
     assert "limitation" in ledger_pipeline.source.describe()
+    ledger.close()
+
+
+def test_a_bar_still_in_progress_at_retrieval_is_not_stored(tmp_path, calendar, market):
+    """Invariant 4 on the collection side: an incomplete bar never enters the ledger.
+
+    A fetch made before the close can return the bar that is still forming. The
+    pipeline would later read it as that bar's finished values unless a later
+    snapshot happened to replace it.
+    """
+    hourly = market.hourly("AAA").frame
+    hourly = hourly[hourly["observed"].astype(bool)][["open", "high", "low", "close", "volume"]]
+    daily = market.daily("AAA").frame[["open", "high", "low", "close", "volume"]].copy()
+    daily.index = pd.DatetimeIndex([calendar.session_open(session) for session in daily.index])
+    _open, close = calendar.session_window(ORIGIN)
+    mid_session = (close - pd.Timedelta(minutes=75)).to_pydatetime()  # 14:45 New York
+    ledger = Ledger(tmp_path / "early.sqlite")
+    ingestor = Ingestor(
+        calendar=calendar,
+        ledger=ledger,
+        snapshots=SnapshotStore(tmp_path / "snapshots"),
+        collector=FixtureCollector(
+            frames={("AAA", "1h"): hourly, ("AAA", "1d"): daily}, retrieved_at=mid_session
+        ),
+    )
+    assert ingestor.ingest(FetchRequest(symbol="AAA", interval="1h", start=ORIGIN)).ok
+    assert ingestor.ingest(FetchRequest(symbol="AAA", interval="1d", start=ORIGIN)).ok
+    stored = ledger.read_bars("AAA", "1h", start=ORIGIN, end=ORIGIN)
+    assert len(stored) == 5  # 09:30 to 14:30 had ended; 14:30-15:30 had not
+    assert all(pd.Timestamp(str(row["bar_end"])) <= pd.Timestamp(mid_session) for row in stored)
+    assert ledger.read_bars("AAA", "1d", start=ORIGIN, end=ORIGIN) == []
     ledger.close()
 
 
@@ -411,6 +525,31 @@ def test_studies_verify_the_holdout_instead_of_asserting_it(
     touched = {("C256", schedule.test_origins[0]): None}
     with pytest.raises(OperationsError, match="reserved origin"):
         _verify_holdout(schedule, touched, [], mode=AccessMode.DEVELOPMENT)
+
+
+def test_studies_report_the_registered_block_length_sensitivity(
+    calendar, config, market, watchlist, stub_forecaster
+):
+    """Section 14: block length 10, 'with 5/20-session sensitivity'."""
+    small = _small_blocks(config)
+    schedule = build_schedule(
+        calendar, small, latest_data_session=DATA_EDGE, earliest_origin=DIAGNOSTIC_EARLIEST
+    )
+    study = run_study(
+        pipeline=_pipeline(small, calendar, market, watchlist, stub_forecaster),
+        schedule=schedule,
+        variant="C256",
+        checkpoint="sensitivity-check",
+        folds=(0,),
+        bootstrap_samples=50,
+    )
+    blocks = tuple(config.validation.bootstrap_block_sensitivity)
+    assert set(study.bootstrap_sensitivity) == set(blocks)
+    for block in blocks:
+        estimates = study.bootstrap_sensitivity[block]
+        assert set(estimates) == set(study.bootstrap)
+        assert all(estimate.block_sessions == block for estimate in estimates.values())
+    assert "sensitivity" in study.to_dict()["bootstrap_block_sensitivity"]["note"]
 
 
 # --------------------------------------------------------------------------- #
@@ -605,6 +744,32 @@ def test_a_split_inside_a_hold_changes_units_not_value(
     assert raw.trades[0].r_net_base == pytest.approx(applied.trades[0].r_net_base, rel=1e-9)
     assert raw.trades[0].r_net_stress == pytest.approx(applied.trades[0].r_net_stress, rel=1e-9)
     np.testing.assert_allclose(raw.daily.returns, applied.daily.returns, rtol=1e-9, atol=1e-12)
+
+
+def test_a_stress_cost_run_still_records_each_trade_at_every_cost_level(calendar, pipeline):
+    """A trade's base, stress and severe returns do not depend on the run's own scenario."""
+    signal = dt.date(2025, 11, 3)
+    selector = _OneShotSelector(signal, Selection("AAA", "ISSUER-AAA", "alpha"))
+    stressed = simulate(
+        pipeline=pipeline, selector=selector, score_sessions=[signal], cost_scenario="stress"
+    )
+    (trade,) = stressed.trades
+    assert trade.r_net_base == pytest.approx(
+        pipeline.label(signal, "AAA", cost_scenario="base").net_return, rel=1e-12
+    )
+    assert trade.r_net_stress == pytest.approx(
+        pipeline.label(signal, "AAA", cost_scenario="stress").net_return, rel=1e-12
+    )
+    # The decision heads are always fitted on base-cost labels: the stress check
+    # is a repricing of the estimate, so stress labels would count it twice.
+    runner = WalkForwardRunner(pipeline=pipeline, cost_scenario="stress")
+    rows = runner.training_rows("B0", sessions=[signal])
+    assert rows and all(
+        row.r_net == pytest.approx(
+            pipeline.label(signal, row.symbol, cost_scenario="base").net_return, rel=1e-12
+        )
+        for row in rows
+    )
 
 
 @dataclasses.dataclass
@@ -840,6 +1005,43 @@ def test_final_test_replays_the_registered_refit_schedule(
     assert any(note.startswith("final-test pass: 10 of the 10 reserved") for note in result.notes)
 
 
+@dataclasses.dataclass
+class _MarketHolder:
+    """Buys the market proxy itself whenever it holds none: zero skill by construction."""
+
+    name: str = "market-holder"
+
+    def select(self, session, book):
+        if "ISSUER-SPY" in book.open_issuers():
+            return SelectionOutcome(selections=())
+        return SelectionOutcome(selections=(Selection("SPY", "ISSUER-SPY", "market"),))
+
+    def provenance(self):
+        return {"forecaster": "none (scripted test selector)"}
+
+
+def test_holding_the_market_shows_no_excess_over_the_matched_benchmark(calendar, config, pipeline):
+    """The exposure-matched benchmark holds the same capital over the same intervals.
+
+    A position entered at the D1 open is decided at D0's after-close run, so its
+    D1 exposure is known in advance and must be matched. Matching only the
+    previous close's exposure skipped every entry day and, in a rising market,
+    credited a zero-skill strategy with excess return over the market.
+    """
+    free = dataclasses.replace(
+        config, execution=dataclasses.replace(config.execution, base_slippage_bps_per_side=0.0)
+    )
+    zero_cost = dataclasses.replace(pipeline, config=free)
+    result = simulate(
+        pipeline=zero_cost,
+        selector=_MarketHolder(),
+        score_sessions=calendar.sessions(dt.date(2025, 10, 1), dt.date(2025, 11, 14)),
+    )
+    assert len(result.trades) > 5 and all(trade.resolved for trade in result.trades)
+    matched = _matched_series(zero_cost, result, "matched")
+    np.testing.assert_allclose(result.daily.returns, matched.returns, rtol=0.0, atol=1e-12)
+
+
 def test_the_dev_test_boundary_is_purged(calendar, config):
     schedule = build_schedule(
         calendar, config, latest_data_session=DATA_EDGE, earliest_origin=DIAGNOSTIC_EARLIEST
@@ -851,6 +1053,31 @@ def test_the_dev_test_boundary_is_purged(calendar, config):
     assert set(schedule.purged_before_test).isdisjoint(schedule.development_origins)
     assert set(schedule.purged_before_test).isdisjoint(schedule.test_origins)
     assert schedule.describe()["purged_before_test"] == purge
+
+
+def test_refits_follow_the_fold_recipe_including_both_purges(calendar, config):
+    """Section 13: refits use 'the same fit/purge/calibration recipe' as the folds."""
+    schedule = build_schedule(calendar, config, latest_data_session=dt.date(2026, 9, 25))
+    purge = config.validation.purge_sessions_per_boundary
+    assert schedule.refit_points
+    for point in schedule.refit_points:
+        assert len(point.purged_before_calibration) == purge
+        assert len(point.calibration_sessions) == config.validation.calibration_origin_sessions
+        # Fit, purge, calibration and the final purge are consecutive origins.
+        sequence = [
+            *point.fit_sessions,
+            *point.purged_before_calibration,
+            *point.calibration_sessions,
+            *point.purged_sessions,
+        ]
+        assert sequence == sorted(set(sequence))
+        # The last fit outcome was observable when calibration began, exactly as
+        # in the folds -- so no fit label shares a holding session with a
+        # calibration label.
+        last_fit = label_available_at(calendar, point.fit_sessions[-1], horizon_sessions=2)
+        assert last_fit.exit_session < point.calibration_sessions[0]
+        assert last_fit.matured_by(point.fit_deadline)
+        assert point.fit_deadline == calendar.signal_time(point.calibration_sessions[0])
 
 
 # --------------------------------------------------------------------------- #

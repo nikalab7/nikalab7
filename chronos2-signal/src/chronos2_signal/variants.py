@@ -34,6 +34,7 @@ import numpy as np
 
 from .config import DesignConfig
 from .evaluation import DailySeries
+from .policy import CorrelationLookup, correlation_block
 
 __all__ = [
     "VariantError",
@@ -42,6 +43,7 @@ __all__ = [
     "variant_spec",
     "MomentumCandidate",
     "rank_momentum_candidates",
+    "MarketLeg",
     "exposure_matched_series",
     "cash_series",
 ]
@@ -138,6 +140,8 @@ def rank_momentum_candidates(
     open_sectors: Mapping[str, int] | None = None,
     open_issuers: Sequence[str] = (),
     open_position_count: int = 0,
+    open_symbols: Sequence[str] = (),
+    correlation: CorrelationLookup | None = None,
 ) -> list[MomentumCandidate]:
     """The fixed relative-momentum control's picks for one origin.
 
@@ -147,7 +151,11 @@ def rank_momentum_candidates(
     which is the only way the comparison means anything.
 
     Eligibility is the caller's job: only already-eligible symbols should be
-    passed in, so that every system sees the same mask.
+    passed in, so that every system sees the same mask. The correlation cap is
+    the candidates' own rule (:func:`~chronos2_signal.policy.correlation_block`),
+    applied against the open positions and the picks already made; without a
+    correlation source, a second position is blocked rather than assumed
+    uncorrelated.
     """
     portfolio = config.portfolio
     taken = dict(open_sectors or {})
@@ -173,37 +181,73 @@ def rank_momentum_candidates(
             break
         if taken.get(candidate.sector, 0) >= portfolio.max_open_per_sector:
             continue
+        if correlation_block(
+            candidate.symbol,
+            [*open_symbols, *(pick.symbol for pick in picks)],
+            correlation,
+            config=config,
+        ):
+            continue
         taken[candidate.sector] = taken.get(candidate.sector, 0) + 1
         picks.append(candidate)
     return picks
+
+
+@dataclass(frozen=True)
+class MarketLeg:
+    """Capital one position had in the market during one session.
+
+    Attributes:
+        session: The session.
+        notional: The position's capital at the start of the leg: its cost
+            basis on the entry session, its market value at the previous close
+            afterwards.
+        from_open: True on the entry session, whose leg runs from the official
+            open to the close; otherwise the leg runs close to close.
+    """
+
+    session: dt.date
+    notional: float
+    from_open: bool
 
 
 def exposure_matched_series(
     *,
     name: str,
     sessions: Sequence[dt.date],
-    market_returns: Sequence[float],
-    candidate_gross_exposure: Sequence[float],
+    legs: Sequence[MarketLeg],
+    equity_before: Mapping[dt.date, float],
+    market_open: Mapping[dt.date, float],
+    market_close: Mapping[dt.date, float],
 ) -> DailySeries:
-    """A market benchmark scaled to the candidate's own gross exposure.
+    """The market, held with the candidate's capital over the candidate's intervals.
 
-    The exposure applied on session ``t`` is the one observed at the previous
-    close, which is what a portfolio could actually have matched. Using the
-    same session's exposure would quietly let the benchmark know the day's
-    allocation in advance.
+    Every leg of every position is replicated in the market proxy: the same
+    capital, from the official open on the entry session and close to close
+    afterwards. A D1 entry is decided at D0's after-close run, so its exposure
+    is known before the open and matching it is not look-ahead -- whereas
+    lagging the exposure by a session would leave every entry day unmatched and
+    credit a zero-skill strategy with the market's drift.
 
     This control exists to answer one question: whether market exposure, rather
-    than forecasting, explains the result.
+    than forecasting, explains the result. A missing proxy price contributes
+    zero for that leg.
     """
-    if not (len(sessions) == len(market_returns) == len(candidate_gross_exposure)):
-        raise VariantError("exposure-matched series inputs must have equal length")
-    market = np.asarray(market_returns, dtype=float)
-    exposure = np.asarray(candidate_gross_exposure, dtype=float)
-    lagged = np.empty_like(exposure)
-    if exposure.size:
-        lagged[0] = 0.0
-        lagged[1:] = exposure[:-1]
-    returns = lagged * market
+    index = {session: position for position, session in enumerate(sessions)}
+    returns = np.zeros(len(sessions), dtype=float)
+    for leg in legs:
+        position = index.get(leg.session)
+        if position is None:
+            raise VariantError(f"leg on {leg.session.isoformat()} is outside the date index")
+        if leg.from_open:
+            start = market_open.get(leg.session)
+        else:
+            start = market_close.get(sessions[position - 1]) if position > 0 else None
+        end = market_close.get(leg.session)
+        base = equity_before.get(leg.session)
+        if not start or not end or not base or start <= 0.0 or base <= 0.0:
+            continue
+        returns[position] += leg.notional / base * (end / start - 1.0)
     return DailySeries(name=name, sessions=tuple(sessions), returns=returns)
 
 

@@ -341,6 +341,22 @@ class DailyPanel:
             raise MarketDataError(f"{self.symbol}: no daily row for {session.isoformat()}")
         return self.frame.loc[session]
 
+    def on_sessions(self, sessions: Sequence[dt.date]) -> "DailyPanel":
+        """This panel laid on the exchange's own session list.
+
+        Every session from the panel's first row onwards gets a row; one the
+        provider did not deliver is ``NaN`` rather than absent. Windows counted
+        in rows then count sessions: a missing day can no longer stretch a
+        "five-session" return to six, and a missing origin row reads as missing
+        instead of yesterday's close standing in for today's.
+        """
+        if not len(self.frame):
+            return self
+        first = self.frame.index[0]
+        wanted = [session for session in sessions if session >= first]
+        frame = self.frame.reindex(pd.Index(wanted, name=self.frame.index.name))
+        return DailyPanel(symbol=self.symbol, frame=frame, snapshot_hash=self.snapshot_hash)
+
 
 def aligned_log_returns(
     left: DailyPanel, right: DailyPanel

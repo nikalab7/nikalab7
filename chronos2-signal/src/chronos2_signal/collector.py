@@ -416,7 +416,10 @@ class Ingestor:
         index = pd.DatetimeIndex(pd.to_datetime(frame.index, utc=True))
         intraday = request.interval not in {"1d", "1wk", "1mo"}
 
-        anchoring: dict[str, list[str]] = {"unexpected": [], "missing": []}
+        # "in_progress": bars that had not ended when the response was retrieved.
+        # Storing one would let a forming bar be read later as finished.
+        anchoring: dict[str, list[str]] = {"unexpected": [], "missing": [], "in_progress": []}
+        retrieved = pd.Timestamp(response.retrieved_at)
         rows = []
         if intraday:
             by_session: dict[dt.date, list[pd.Timestamp]] = {}
@@ -438,6 +441,9 @@ class Ingestor:
                     bar = schedule.get(start)
                     if bar is None:
                         continue  # already reported as unexpected anchoring
+                    if bar.end > retrieved:
+                        anchoring["in_progress"].append(start.isoformat())
+                        continue
                     record = frame.loc[index == start]
                     rows.append(
                         self._bar_row(
@@ -457,6 +463,9 @@ class Ingestor:
                     anchoring["unexpected"].append(timestamp.isoformat())
                     continue
                 open_ts, close_ts = self.calendar.session_window(session)
+                if close_ts > retrieved:
+                    anchoring["in_progress"].append(timestamp.isoformat())
+                    continue
                 record = frame.loc[index == timestamp]
                 rows.append(
                     self._bar_row(

@@ -52,7 +52,8 @@ from chronos2_signal.sources import FixtureMarketSource
 from chronos2_signal.portfolio import EntryRequest, ReferencePortfolio
 from chronos2_signal.protocol import ProtocolError, build_schedule, label_available_at
 from chronos2_signal.storage import Ledger, SnapshotStore, StorageError
-from chronos2_signal.variants import cash_series, exposure_matched_series
+from chronos2_signal.operations import _matched_series
+from chronos2_signal.variants import cash_series
 
 ORIGIN = dt.date(2025, 11, 25)
 DIAGNOSTIC_EARLIEST = dt.date(2024, 7, 1)
@@ -1205,20 +1206,7 @@ def test_invariant_12_baselines_share_dates_fills_costs_and_capital(
     # Controls are constructed on that same index, and idle cash earns zero for
     # every system alike.
     sessions = candidate.daily.sessions
-    # One view at the last session: one consistently restated series.
-    spy = pipeline.source.view(sessions[-1]).daily_panel("SPY")
-    market_returns, previous = [], None
-    for session in sessions:
-        close = float(spy.row(session)["close"])
-        market_returns.append(0.0 if previous is None else close / previous - 1.0)
-        previous = close
-    exposure = [day.gross_exposure for day in candidate.portfolio.days]
-    matched = exposure_matched_series(
-        name="spy_exposure_matched",
-        sessions=sessions,
-        market_returns=market_returns,
-        candidate_gross_exposure=exposure,
-    )
+    matched = _matched_series(pipeline, candidate, "spy_exposure_matched")
     cash = cash_series("cash", sessions)
     assert matched.sessions == sessions == cash.sessions
     assert float(np.abs(cash.returns).max(initial=0.0)) == 0.0

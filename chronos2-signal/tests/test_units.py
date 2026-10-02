@@ -22,6 +22,7 @@ from chronos2_signal.actions import (
     max_adverse_excursion,
     reprice_net_return,
 )
+from chronos2_signal.calendar_spec import ExchangeCalendar
 from chronos2_signal.collector import (
     FetchRequest,
     FixtureCollector,
@@ -41,6 +42,7 @@ from chronos2_signal.decision import (
     fit_decision_model,
 )
 from chronos2_signal.evaluation import (
+    BootstrapEstimate,
     DailySeries,
     TradeRecord,
     block_profitability,
@@ -63,6 +65,7 @@ from chronos2_signal.features import (
     sigma_2d,
 )
 from chronos2_signal.forecaster import DeterministicStubForecaster
+from chronos2_signal.operations import select_candidate
 from chronos2_signal.policy import OutputLabel, PolicyEngine, dedup_key
 from chronos2_signal.portfolio import EntryRequest, ReferencePortfolio
 from chronos2_signal.protocol import (
@@ -211,6 +214,15 @@ def test_cost_scenarios_are_ordered(config):
 # --------------------------------------------------------------------------- #
 # Channels and features
 # --------------------------------------------------------------------------- #
+
+
+def test_calendar_answers_do_not_depend_on_lookup_order(config):
+    """A late lookup first must not shrink the history an earlier origin can see."""
+    fresh = ExchangeCalendar(config.runtime.exchange_calendar)
+    expected = fresh.bars_ending_at(dt.date(2025, 5, 1), 659)
+    warm = ExchangeCalendar(config.runtime.exchange_calendar)
+    warm.session_close(dt.date(2026, 9, 25))
+    assert warm.bars_ending_at(dt.date(2025, 5, 1), 659) == expected
 
 
 def test_channel_and_feature_counts_match_the_protocol():
@@ -608,6 +620,27 @@ def test_calibration_block_must_be_later_and_disjoint(config):
     assert "disjoint" in str(excinfo.value)
 
 
+def test_a_label_without_an_availability_time_is_dropped_under_a_deadline():
+    """The leakage check fails closed: an unknown availability time is not trusted."""
+    from chronos2_signal.decision import _usable_rows
+
+    deadline = dt.datetime(2025, 3, 1, 21, tzinfo=dt.timezone.utc)
+    rows = [
+        OriginRow(
+            origin_session=dt.date(2025, 2, 3), symbol="A", features={}, sigma_2d=0.02,
+            r_net=0.01, label_available_at=dt.datetime(2025, 2, 5, 23, tzinfo=dt.timezone.utc),
+        ),
+        OriginRow(
+            origin_session=dt.date(2025, 2, 3), symbol="B", features={}, sigma_2d=0.02,
+            r_net=0.01, label_available_at=None,
+        ),
+    ]
+    kept, dropped = _usable_rows(rows, deadline)
+    assert [row.symbol for row in kept] == ["A"] and dropped == 1
+    # Without a deadline there is nothing to check against, and both are kept.
+    assert len(_usable_rows(rows, None)[0]) == 2
+
+
 def test_estimate_rescales_by_sigma_and_reprices_costs(config):
     columns = column_set_for_variant("B0")
     rng = np.random.default_rng(5)
@@ -892,6 +925,36 @@ def test_existing_exposure_may_drift_above_the_cap_without_a_rebalance(config):
     assert day.open_positions == 3
 
 
+def test_an_explicit_fee_is_charged_exactly_as_the_label_charges_it(config):
+    """The portfolio and the registered label must agree once a broker fee is set."""
+    from chronos2_signal.actions import HoldingCosts, label_net_return
+
+    fee = 0.001
+    priced = dataclasses.replace(
+        config, execution=dataclasses.replace(config.execution, explicit_fee_fraction=fee)
+    )
+    book = ReferencePortfolio(config=priced, variant="fee-check")
+    entry, exit_session = dt.date(2025, 6, 10), dt.date(2025, 6, 11)
+    position = book.allocate(
+        EntryRequest(
+            signal_id="s", symbol="AAA", issuer_id="I-AAA", sector="alpha",
+            signal_session=dt.date(2025, 6, 9), entry_session=entry,
+            planned_exit_session=exit_session, reference_open_price=100.0,
+        ),
+        equity_at_open=100_000.0,
+        gross_value_at_open=0.0,
+    )
+    book.close_due(exit_session, {"AAA": 102.0})
+    slippage = priced.execution.slippage_fraction("base")
+    label = label_net_return(
+        entry_session=entry, exit_session=exit_session, entry_open_price=100.0,
+        exit_close_price=102.0,
+        costs=HoldingCosts(buy_slippage=slippage, sell_slippage=slippage, explicit_fee_fraction=fee),
+    )
+    assert position.realised_net_return() == pytest.approx(label.net_return, rel=1e-12)
+    assert book.cash == pytest.approx(100_000.0 * (1.0 + 0.1 * label.net_return), rel=1e-12)
+
+
 def test_missing_exit_price_keeps_the_trade_in_the_ledger(config):
     book = ReferencePortfolio(config=config, variant="delisting-check")
     book.allocate(
@@ -995,7 +1058,10 @@ def test_momentum_control_respects_the_same_capacity_rules(config):
         MomentumCandidate("CCC", "I-CCC", "beta", 0.03),
         MomentumCandidate("DDD", "I-DDD", "gamma", -0.01),
     ]
-    picks = rank_momentum_candidates(candidates, config=config)
+    def uncorrelated(left, right):
+        return 0.1
+
+    picks = rank_momentum_candidates(candidates, config=config, correlation=uncorrelated)
     assert [pick.symbol for pick in picks] == ["AAA", "CCC"]  # one per sector, top two
 
     with_open = rank_momentum_candidates(
@@ -1004,8 +1070,27 @@ def test_momentum_control_respects_the_same_capacity_rules(config):
         open_sectors={"alpha": 1},
         open_issuers=["I-CCC"],
         open_position_count=2,
+        correlation=uncorrelated,
     )
     assert [pick.symbol for pick in with_open] == []
+
+    # The correlation cap is one of "the same capacity rules": a pair above it
+    # is not added, and an unmeasurable pair blocks rather than passing.
+    def correlated(left, right):
+        return 0.95 if {left, right} == {"AAA", "CCC"} else 0.1
+
+    assert [pick.symbol for pick in rank_momentum_candidates(
+        candidates, config=config, correlation=correlated
+    )] == ["AAA"]
+    assert [pick.symbol for pick in rank_momentum_candidates(
+        candidates, config=config, correlation=lambda left, right: None
+    )] == ["AAA"]
+    # Against an open position too: with CCC held, AAA is blocked and the next
+    # name in its sector takes the slot.
+    assert [pick.symbol for pick in rank_momentum_candidates(
+        candidates, config=config, correlation=correlated, open_symbols=["CCC"],
+        open_sectors={"beta": 1}, open_issuers=["I-CCC"], open_position_count=1,
+    )] == ["BBB"]
 
 
 # --------------------------------------------------------------------------- #
@@ -1055,7 +1140,7 @@ def test_block_bootstrap_preserves_block_structure():
     assert not wide.excludes_zero_above
 
 
-def test_trade_metrics_report_no_alert_origins():
+def test_trade_metrics_report_origins_without_trades():
     trades = [
         TradeRecord(dt.date(2025, 1, 6), "AAA", "I-AAA", "alpha", 0.02, 0.015, 0.01),
         TradeRecord(dt.date(2025, 1, 7), "BBB", "I-BBB", "beta", -0.01, -0.015, -0.02),
@@ -1063,14 +1148,14 @@ def test_trade_metrics_report_no_alert_origins():
     metrics = trade_metrics(trades, origins_scanned=20)
     assert metrics.trades == 2
     assert metrics.distinct_sessions == 2
-    assert metrics.no_alert_origins == 18
-    assert metrics.alert_coverage == pytest.approx(0.1)
+    assert metrics.origins_without_trades == 18
+    assert metrics.trade_coverage == pytest.approx(0.1)
     assert metrics.win_rate == pytest.approx(0.5)
     assert metrics.profit_factor == pytest.approx(2.0)
 
     empty = trade_metrics([], origins_scanned=20)
     assert empty.trades == 0
-    assert empty.no_alert_origins == 20
+    assert empty.origins_without_trades == 20
     assert math.isnan(empty.win_rate)
 
 
@@ -1094,6 +1179,105 @@ def test_concentration_and_block_profitability():
     assert len(blocks) == 3
     assert blocks[0]["total_return"] > 0
     assert blocks[1]["total_return"] < 0
+
+
+def _gate(config, number, *, returns, trades):
+    """Run the registered gates on a synthetic record and return one gate."""
+    sessions = tuple(dt.date(2025, 1, 6) + dt.timedelta(days=i) for i in range(len(returns)))
+    report = evaluate_promotion_gates(
+        checkpoint="unit-test",
+        historical_trades=trades,
+        forward_trades=[],
+        forward_sessions=0,
+        portfolio_series=DailySeries(name="C256", sessions=sessions, returns=np.asarray(returns)),
+        baseline_series={},
+        bootstrap={},
+        calibration_brier=float("nan"),
+        base_rate_brier=float("nan"),
+        coverage_p10_p90=float("nan"),
+        reliability=[],
+        config_min_forward_sessions=config.validation.forward_min_sessions,
+        config_min_forward_signals=config.validation.forward_min_executed_signals,
+        config_min_combined_signals=config.validation.combined_evaluation_min_executed_signals,
+        config_min_combined_sessions=config.validation.combined_evaluation_min_signal_sessions,
+        config_min_profitable_blocks=config.validation.promotion_min_profitable_blocks,
+        config_block_sessions=config.validation.promotion_block_sessions,
+        historical_origins_scanned=len(returns),
+        assessed_at=dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc),
+    )
+    return next(result for result in report.results if result.number == number)
+
+
+def _trade(day, issuer, sector, r_net, *, resolved=True):
+    return TradeRecord(
+        dt.date(2025, 1, day), issuer, f"I-{issuer}", sector, r_net, r_net, r_net, resolved=resolved
+    )
+
+
+def test_gate_five_counts_only_full_twenty_session_blocks(config):
+    """A two-session tail is not one of the 'three separate 20-session blocks'."""
+    returns = [0.001] * 20 + [0.001] * 20 + [-0.001] * 20 + [0.001] * 2
+    trades = [_trade(6 + i, f"S{i}", f"s{i}", 0.01) for i in range(6)]
+    gate = _gate(config, 5, returns=returns, trades=trades)
+    assert not gate.passed, gate.detail
+    assert "2 of 3" in gate.detail
+
+
+def test_an_unresolved_trade_does_not_stand_in_for_the_best_one():
+    """Removing the single best trade means the best *known* trade."""
+    trades = [_trade(6, "AAA", "a", 0.30), *[_trade(7 + i, f"L{i}", "b", -0.01) for i in range(5)]]
+    trades.append(_trade(20, "ZZZ", "c", float("nan"), resolved=False))
+    concentration = contributor_concentration(trades)
+    assert concentration["profitable_excluding_best_trade"] is False
+    assert concentration["sum_excluding_best_trade"] == pytest.approx(-0.05)
+    assert concentration["unresolved"] == 1
+
+
+def test_gate_six_restricts_a_claim_explained_by_one_sector(config):
+    """'If one issuer/sector explains almost everything' -- sector as well as issuer."""
+    one_sector = [_trade(6 + i, f"S{i}", "energy", 0.02) for i in range(3)]
+    assert not _gate(config, 6, returns=[0.0] * 20, trades=one_sector).passed
+    # A diversified result passes ...
+    spread = [_trade(6 + i, f"S{i}", f"sector{i}", 0.02) for i in range(4)]
+    assert _gate(config, 6, returns=[0.0] * 20, trades=spread).passed
+    # ... and a losing one has no profit to attribute, so it cannot pass.
+    losing = [_trade(6 + i, f"S{i}", f"sector{i}", -0.02) for i in range(4)]
+    assert not _gate(config, 6, returns=[0.0] * 20, trades=losing).passed
+
+
+def test_selection_follows_the_registered_rule(config):
+    """Section 12: rank by the 90% lower bound; keep C256 only if differences are inconclusive."""
+
+    @dataclasses.dataclass
+    class _System:
+        trades: tuple
+        origins_scanned: int = 40
+
+    floors_met = tuple(_trade(1 + i % 28, f"S{i}", f"s{i % 4}", 0.005) for i in range(45))
+    systems = {name: _System(trades=floors_met) for name in ("B0", "C256", "C512")}
+
+    def estimate(name, lower):
+        return BootstrapEstimate(
+            name=name, point=lower + 0.0002, lower=lower, upper=lower + 0.0004,
+            confidence=0.90, block_sessions=10, samples=100, n_sessions=40,
+        )
+
+    bootstrap = {
+        "C512": estimate("C512", -0.00005),
+        "C256": estimate("C256", -0.00020),
+        "C512_minus_C256": estimate("C512_minus_C256", 0.00010),
+        "C512_minus_B0": estimate("C512_minus_B0", -0.00010),
+    }
+    decision = select_candidate(config=config, systems=systems, bootstrap=bootstrap)
+    # C512 leads and its difference from the runner-up is conclusive. Section 12
+    # sets no further condition on the leader's own lower bound.
+    assert decision.selected == "C512"
+    assert decision.transformer_edge_claimable is False  # it does not beat B0
+
+    bootstrap["C512_minus_C256"] = estimate("C512_minus_C256", -0.00001)
+    inconclusive = select_candidate(config=config, systems=systems, bootstrap=bootstrap)
+    assert inconclusive.selected is None
+    assert inconclusive.retained_for_research == "C256"
 
 
 def test_promotion_gates_fail_closed(config):

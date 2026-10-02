@@ -11,7 +11,7 @@ pipeline, including the orchestration for build-order steps 4–6. Steps 1, 2 (l
 
 - All twelve section-16 integrity invariants pass on controlled fixtures
   ([INVARIANTS.md](INVARIANTS.md)).
-- 90 tests pass offline: no network, no checkpoint, no market data. 24 of them are
+- 105 tests pass offline: no network, no checkpoint, no market data. 32 of them are
   system-level tests that go through the pipeline rather than calling components
   directly, and each was mutation-checked against the defect it guards.
 - The collector's ledger reaches the pipeline through a session- and vintage-bounded
@@ -48,20 +48,23 @@ This is the important half of the status.
 
 ## Unverified against the real checkpoint
 
-The one module that cannot be checked here is the Chronos-2 adapter's mapping to and from
-the library, because the package and weights are unreachable. Two parts of it follow the
-documented pattern as understood, and the smoke test exists to confirm them:
+The weights are unreachable (Hugging Face is blocked), so the checkpoint's numerical
+behaviour cannot be checked here. The adapter's mapping to and from the library *was*
+checked on 2 October 2026 against the source of `chronos-forecasting` 2.3.2, which
+PyPI does serve:
 
-- **Input.** A known-future covariate is passed under the same name in
-  `past_covariates` (its history) and `future_covariates` (its horizon values).
+- **Input — matches.** The library documents `past_covariates` as "past-only
+  covariates or past values of known future covariates" and requires every
+  `future_covariates` key to appear in `past_covariates`: exactly the adapter's
+  mapping. Its batch budget counts series, covariates included, as the adapter's
+  channel batching assumes, and NaN marks a missing value.
+- **Output — matches.** `predict_quantiles` returns `(quantiles, mean)`, each a list
+  with one tensor per task of shape `(n_variates, prediction_length, n_quantiles)`,
+  and the library states that "the median is returned as the mean". The adapter
+  unpacks the pair and transposes that shape correctly.
+- **Still unverified:** whether the pretrained weights actually *use* every channel.
   `smoke` perturbs the calendar history, the calendar future and the past-only
-  covariates in turn and **fails if any group leaves the output unchanged** — which is
-  how a wrong mapping would show: not as an error, but as a model quietly forecasting
-  from less than it was given.
-- **Output.** `predict_quantiles` is taken to return `(quantiles, mean)`. The adapter
-  unpacks that pair explicitly, decides the quantile axis from the requested level count
-  instead of assuming it, and blocks the forecast rather than guessing when the two
-  axes cannot be told apart.
+  covariates in turn and fails if any group leaves the output unchanged.
 
 ## The chronology the protocol currently supports
 
@@ -107,7 +110,14 @@ chronos2-signal schedule --latest-session 2026-09-25
 - **A missing exit price writes the position down to zero.** The trade stays in the
   ledger as unresolved, as the protocol requires, but the portfolio carries no value for
   it. That is conservative for any performance claim; it is not an accurate mark. The
-  same applies to a position whose units a later view cannot reconcile.
+  same applies to a position whose units a later view cannot reconcile. A 10%
+  position written off is a 10% drawdown, which trips the absorbing drawdown pause, so
+  one data failure can stop a variant trading for the rest of a run.
+- **Two readings of the text are open.** Feature f15 measures the drawdown from a
+  20-session high that includes the origin day, while f11's "preceding" excludes it;
+  the design text allows either. And section 14's moving-block bootstrap, as
+  registered, gives the first and last sessions about a tenth of the weight of the
+  middle ones; a circular block bootstrap would not.
 - **A view from before a split can disagree with its own action ledger.** A view
   restates only the splits inside its data. If the provider left a *later* split
   unrestated, a view from before it quotes pre-split prices while the ledger it returns

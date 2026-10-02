@@ -384,11 +384,17 @@ class ExchangeCalendar:
         """
         if count < 1:
             raise CalendarError("count must be at least 1")
-        pos = self._position(origin_session)
-
         # Sessions hold at most ceil(390/60) = 7 bars, so count//4 + 4 sessions
         # is a generous first guess even with half days in the window.
         needed = count // 4 + 4
+        # The session index covers whatever range earlier lookups asked for,
+        # which may begin just before this origin. Reach back far enough first
+        # -- two calendar days per session clears weekends and holidays -- so
+        # the answer cannot depend on the order of earlier calls.
+        self._ensure_covered(
+            origin_session - dt.timedelta(days=2 * needed + 14), origin_session
+        )
+        pos = self._position(origin_session)
         while True:
             if needed >= pos:
                 needed = pos  # all available history before the origin

@@ -42,6 +42,16 @@ amendment.
   origin after that session's exits and daily mark. The earlier order contradicted
   section 10 — "new next-open entries use the state after that close" — so this corrects
   the implementation toward the text rather than changing it.
+- **The development selection rule** (2 October 2026). The implementation required the
+  leading candidate's own 90% lower bound to be above zero before selecting it. Section
+  12 contains no such condition: it ranks eligible candidates by that lower bound and
+  retains C256 only "if differences are inconclusive". The extra condition was removed;
+  whether a selected candidate's return is credibly positive is the final test's
+  question.
+- **Refits and block-length sensitivity** (2 October 2026). The prequential refits now
+  use the folds' fit/purge/calibration recipe, which section 13 requires ("the same
+  fit/purge/calibration recipe"), and the 5/20-session bootstrap sensitivity of section
+  14 is now computed. Both bring the implementation to the registered text.
 
 ## Clarification that departs from the letter of the text
 

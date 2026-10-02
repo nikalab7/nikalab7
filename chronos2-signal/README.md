@@ -72,7 +72,7 @@ own report says that its numbers describe a seeded random walk.
 pytest -q
 ```
 
-90 tests, fully offline. The twelve integrity invariants of the protocol's section 16
+105 tests, fully offline. The twelve integrity invariants of the protocol's section 16
 are in `tests/test_invariants.py` and are mapped to what they protect in
 [`docs/INVARIANTS.md`](docs/INVARIANTS.md). Among other things they prove that
 appending future prices cannot change an earlier origin's features, that a split

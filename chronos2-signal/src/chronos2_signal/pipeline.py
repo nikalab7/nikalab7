@@ -52,7 +52,7 @@ from .provenance import stable_hash
 from .quality import EligibilityResult, evaluate_eligibility
 from .sources import MarketSource, MarketView, SourceError
 from .universe import WatchlistManifest
-from .variants import variant_spec
+from .variants import REGISTERED_VARIANTS, variant_spec
 
 __all__ = [
     "PipelineError",
@@ -147,6 +147,26 @@ class ResearchPipeline:
 
     # -- batches ----------------------------------------------------------- #
 
+    def panel_bars(self) -> int:
+        """Hourly bars every variant loads, whatever its own context length.
+
+        Two requirements meet here: the common eligibility mask is defined over
+        a fixed number of scheduled bars, and the matching-slot volume channel
+        needs twenty further sessions before a context's left edge. Sizing the
+        panel by the *longest registered* context, rather than by each
+        variant's own, is what makes the split audit -- and so the mask -- the
+        same for every variant: a data problem in the stretch only C512 reads
+        excludes the stock for all of them, never for C512 alone.
+        """
+        longest = max(
+            spec.context_length or self.config.model.context_length
+            for spec in REGISTERED_VARIANTS.values()
+        )
+        return max(
+            recommended_panel_bars(longest),
+            self.config.universe.common_hourly_history_bars,
+        )
+
     def build_batch(
         self,
         origin_session: dt.date,
@@ -168,15 +188,7 @@ class ResearchPipeline:
         view = self.source.view(origin_session)
         notes: list[str] = []
         context = spec.context_length or self.config.model.context_length
-        # Two independent requirements: the common eligibility mask is defined
-        # over a fixed number of scheduled bars, and the matching-slot volume
-        # channel needs a further twenty sessions before the context's left
-        # edge. Every variant loads the larger of the two so that all of them
-        # share one mask.
-        panel_bars = max(
-            recommended_panel_bars(context),
-            self.config.universe.common_hourly_history_bars,
-        )
+        panel_bars = self.panel_bars()
         proxy = self.market_proxy or "SPY"
 
         market_hourly, reason = self._usable_context_panel(view, proxy, panel_bars)
@@ -273,6 +285,7 @@ class ResearchPipeline:
                 peer_daily=peers_by_sector.get(member.sector, {}),
                 config_sigma_window=self.config.decision.sigma_daily_window_sessions,
                 config_sigma_floor=self.config.decision.sigma_2d_floor,
+                calendar=self.calendar,
             )
             if not daily_features.valid:
                 scores.append(

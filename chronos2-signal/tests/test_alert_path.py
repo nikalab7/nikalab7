@@ -138,7 +138,7 @@ def test_alerts_fire_and_produce_reconciled_trades(fitted, permissive_config):
     metrics = trade_metrics(result.trades, origins_scanned=result.origins_scanned)
     assert metrics.trades == len(result.trades)
     assert metrics.origins_scanned == len(fold.validation_sessions)
-    assert 0.0 <= metrics.alert_coverage <= 1.0
+    assert 0.0 <= metrics.trade_coverage <= 1.0
 
 
 def test_after_close_commits_before_notifying(tmp_path, fitted, permissive_pipeline):

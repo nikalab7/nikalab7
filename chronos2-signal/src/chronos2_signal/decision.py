@@ -581,7 +581,12 @@ def fit_decision_model(
         calibration_dates=len(set(calibration_sessions)),
         clip_fraction=clip_fraction,
         positive_label_rate=float(np.average(labels, weights=weights)),
-        label_timestamps_checked=config.validation.require_label_available_timestamp_check,
+        # True only when the check actually ran, not merely when it is required.
+        label_timestamps_checked=(
+            config.validation.require_label_available_timestamp_check
+            and fit_deadline is not None
+            and calibration_deadline is not None
+        ),
         sample_weight_total=float(weights.sum()),
         dropped_rows=fit_dropped + calibration_dropped,
         notes=tuple(notes),
@@ -605,17 +610,20 @@ def fit_decision_model(
 def _usable_rows(
     rows: Sequence[OriginRow], deadline: dt.datetime | None
 ) -> tuple[list[OriginRow], int]:
-    """Labelled rows whose outcomes were observable by ``deadline``."""
+    """Labelled rows whose outcomes were observable by ``deadline``.
+
+    With a deadline, a row that does not say when its label became observable
+    is dropped, not trusted: an unknown availability time cannot be shown to
+    precede the deadline, and the check must fail closed.
+    """
     kept: list[OriginRow] = []
     dropped = 0
     for row in rows:
         if not row.labelled:
             dropped += 1
             continue
-        if (
-            deadline is not None
-            and row.label_available_at is not None
-            and row.label_available_at > deadline
+        if deadline is not None and (
+            row.label_available_at is None or row.label_available_at > deadline
         ):
             dropped += 1
             continue
