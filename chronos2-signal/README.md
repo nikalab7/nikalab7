@@ -117,7 +117,8 @@ src/chronos2_signal/
   notifier.py       renders persisted signals; contacts nothing
   cli.py            command line entry points
   fixtures.py       deterministic synthetic market for tests
-docs/                 DESIGN, STATUS, BUILD_ORDER, INVARIANTS, ENVIRONMENT, AMENDMENTS
+docs/                 DESIGN, STATUS, ANALYSIS, BUILD_ORDER, INVARIANTS, ENVIRONMENT, AMENDMENTS
+analysis/             positive control, edge ceiling and power experiments behind ANALYSIS
 ```
 
 ## Design choices worth knowing before reading the code
@@ -151,6 +152,14 @@ docs/                 DESIGN, STATUS, BUILD_ORDER, INVARIANTS, ENVIRONMENT, AMEN
 - **One engine, one scoring path.** Candidates, B0 and the momentum control run through
   the same session loop, and the backtest scores origins with the same function as the
   live after-close run. A backtest therefore describes the code that would run.
+
+## What the registered design can show
+
+Before any data is examined, [`docs/ANALYSIS.md`](docs/ANALYSIS.md) asks whether the
+experiment can produce a credible positive result. A planted-edge positive control shows
+the pipeline finds a large edge end to end; a power analysis shows that under the
+registered rules a realistic edge yields no alerts and cannot be confirmed by the
+60-origin test. The options for that are the protocol owner's decision.
 
 ## Limitations that implementation cannot fix
 

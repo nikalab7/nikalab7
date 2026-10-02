@@ -46,6 +46,15 @@ This is the important half of the status.
 
 **No edge is claimed, and none has been tested.**
 
+## What the registered design can and cannot show
+
+A positive control and a power analysis ([ANALYSIS.md](ANALYSIS.md)) found that the
+pipeline detects a large planted edge end to end, but that under the registered rules a
+realistic edge produces no alerts and cannot be confirmed by a 60-origin test. The
+expected outcome on real data is therefore "no edge demonstrated" whether or not an
+edge exists. ANALYSIS.md lists the options; each changes the protocol and must be
+decided before any real outcome is examined.
+
 ## Unverified against the real checkpoint
 
 The weights are unreachable (Hugging Face is blocked), so the checkpoint's numerical
