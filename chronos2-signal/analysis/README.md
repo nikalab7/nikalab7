@@ -11,6 +11,7 @@ claim.
 | `edge_ceiling.py` | The best any model could do with that planted edge (an optimal Kalman-filter estimate) | seconds |
 | `power_portfolio.py` | How often the reference-portfolio test confirms a true per-trade edge, at the registered sample sizes | a few minutes |
 | `power_rank_ic.py` | The same for a cross-sectional rank-IC test on the same dates | about a minute |
+| `power_ic_difference.py` | The same for the test adopted in `chronos2_hourly_v2`: the paired daily rank-IC gain of a candidate over B0 | a few minutes |
 
 Run from the project root with the package installed:
 
@@ -21,6 +22,7 @@ done; wait
 python analysis/edge_ceiling.py
 python analysis/power_portfolio.py
 python analysis/power_rank_ic.py
+python analysis/power_ic_difference.py
 ```
 
 `positive_control.py` mirrors the real chronology: about 224 labelled origins, two

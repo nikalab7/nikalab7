@@ -27,7 +27,12 @@ from chronos2_signal.decision import OriginRow, column_set_for_variant, fit_deci
 from chronos2_signal.features import build_chronos_task, recommended_panel_bars
 from chronos2_signal.fixtures import SyntheticMarket
 from chronos2_signal.forecast_store import ForecastCache
-from chronos2_signal.forecaster import Chronos2Forecaster, DeterministicStubForecaster
+from chronos2_signal.forecaster import (
+    Chronos2Forecaster,
+    DeterministicStubForecaster,
+    _terminal_indices,
+    validate_quantile_paths,
+)
 from chronos2_signal.holdout import AccessMode, HoldoutViolation
 from chronos2_signal.market import DailyPanel, aligned_log_returns
 from chronos2_signal.notifier import Notifier, RecordingChannel
@@ -36,6 +41,7 @@ from chronos2_signal.operations import (
     _matched_series,
     _verify_holdout,
     render_comparison_markdown,
+    render_markdown,
     run_after_close,
     run_development_comparison,
     run_final_test,
@@ -975,11 +981,27 @@ def test_development_comparison_runs_every_system_on_one_date_index(
     assert math.isfinite(report.coverage_p10_p90)
     assert math.isnan(comparison.predictive["B0"].coverage_p10_p90)
 
+    # The selection reads the paired rank-IC test (amended section 12): B0 and
+    # C256 on one shared date index, on the rows both scored, at 90%.
+    information = comparison.information
+    assert information is not None
+    assert information.baseline == "B0" and information.candidates == ("C256",)
+    assert information.series["B0"].sessions == information.series["C256"].sessions
+    assert 0 < information.dates <= len(scored)
+    assert information.confidence == small.validation.development_selection_bootstrap_confidence
+    assert information.gain("C256") is not None
+    # The negative control on this fixture: a stub adds nothing beyond B0.
+    assert not information.demonstrated("C256")
+
     selection = comparison.selection
-    assert "C256" in selection.eligibility
+    assert "C256" in selection.eligibility and "C256" in selection.trading_floors
     assert selection.retained_for_research == (selection.selected or "C256")
+    assert selection.transformer_edge_claimable is False
     assert any(note.startswith("holdout verified: 0 of the 10 reserved") for note in comparison.notes)
-    assert "Selection:" in render_comparison_markdown(comparison)
+    markdown = render_comparison_markdown(comparison)
+    assert "Selection:" in markdown
+    assert "## Primary information test: rank IC against B0" in markdown
+    assert comparison.to_dict()["information_test"]["dates"] == information.dates
 
 
 def test_final_test_replays_the_registered_refit_schedule(
@@ -1003,6 +1025,100 @@ def test_final_test_replays_the_registered_refit_schedule(
     assert result.baseline is not None and result.baseline.variant == "B0"
     assert len(result.gates.results) == 8
     assert any(note.startswith("final-test pass: 10 of the 10 reserved") for note in result.notes)
+    # The final test answers the primary question on the reserved origins only,
+    # at the promotion confidence, beside -- not inside -- the eight gates.
+    information = result.information
+    assert information is not None
+    assert set(information.series["C256"].sessions) <= set(schedule.test_origins)
+    assert information.confidence == small.validation.promotion_bootstrap_confidence
+    # Ten dates are a single ten-session block: nothing to resample, so the stub
+    # is not credited with information however its mean came out.
+    assert 0 < information.dates <= 10 and not information.demonstrated("C256")
+    assert (
+        f"**Adds information beyond B0:** not measurable ({information.dates} dates are too "
+        "few to resample in 10-session blocks)"
+    ) in render_markdown(result)
+
+
+@dataclasses.dataclass
+class _Clairvoyant:
+    """A fixture forecaster that reads the realised future. Test-only, not a model.
+
+    Its median path is the fixture's actual future closes: information B0 cannot
+    have by construction. It is the positive control for the information test --
+    a Chronos candidate built on it must rank stocks better than B0 -- and, being
+    a fixture, it must never be credited to Chronos-2.
+    """
+
+    market: SyntheticMarket
+    quantile_levels: tuple[float, ...]
+
+    is_frozen_checkpoint = False
+
+    def predict(self, tasks):
+        ladder = {0.10: -1.2816, 0.25: -0.6745, 0.50: 0.0, 0.75: 0.6745, 0.90: 1.2816}
+        results = []
+        for task in tasks:
+            closes = self.market.hourly(task.symbol).frame["close"]
+            future = closes.reindex(pd.DatetimeIndex([bar.start for bar in task.horizon_bars]))
+            median = 100.0 * np.log(future.to_numpy(dtype=float) / task.origin_close)
+            spread = np.sqrt(np.arange(1, len(median) + 1, dtype=float))
+            paths = np.vstack([median + ladder[level] * spread for level in self.quantile_levels])
+            results.append(
+                validate_quantile_paths(
+                    task.symbol, task.origin_session, self.quantile_levels, paths,
+                    task.prediction_length, _terminal_indices(task),
+                )
+            )
+        return results
+
+    def provenance(self):
+        return {"forecaster": "clairvoyant_test_fixture", "is_frozen_checkpoint": False}
+
+
+def test_the_information_test_detects_information_b0_cannot_have(
+    calendar, config, market, watchlist
+):
+    """Positive control, end to end: real extra information is found, and not claimed.
+
+    With forecasts that know the future, C256 must out-rank B0 on the same rows
+    and dates by a margin the paired bootstrap separates from zero, in
+    development and in the final test. The selection and the report must still
+    claim nothing for Chronos-2, because a fixture produced the forecasts. Both
+    blocks hold 20 dates: two full bootstrap blocks, the least that resamples.
+    """
+    small = _small_blocks(
+        config, development_min_information_dates=10, final_historical_test_origin_sessions=20
+    )
+    clairvoyant = _Clairvoyant(market=market, quantile_levels=config.model.quantile_levels)
+    pipeline = _pipeline(small, calendar, market, watchlist, clairvoyant)
+
+    development = build_schedule(
+        calendar, small, latest_data_session=DATA_EDGE, earliest_origin=DIAGNOSTIC_EARLIEST
+    )
+    comparison = run_development_comparison(
+        pipeline=pipeline, schedule=development, variants=("C256",), folds=(0, 1),
+        bootstrap_samples=200,
+    )
+    information = comparison.information
+    assert information is not None and information.dates >= 10
+    assert information.demonstrated("C256"), information.gain("C256")
+    assert information.mean_ic("C256") > information.mean_ic("B0") + 0.2
+    selection = comparison.selection
+    assert selection.selected == "C256" and selection.eligibility["C256"] == ()
+    assert selection.transformer_edge_claimable is False
+    assert "nothing is claimed for Chronos-2" in selection.statement
+
+    final = build_schedule(
+        calendar, small, latest_data_session=DATA_EDGE, earliest_origin=dt.date(2025, 8, 1)
+    )
+    result = run_final_test(
+        pipeline=pipeline, schedule=final, variant="C256", bootstrap_samples=200
+    )
+    assert result.information is not None and result.information.dates == 20
+    assert result.information.demonstrated("C256"), result.information.gain("C256")
+    assert result.information_demonstrated is False
+    assert "not claimed: a test fixture produced the forecasts" in render_markdown(result)
 
 
 @dataclasses.dataclass

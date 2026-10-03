@@ -216,17 +216,29 @@ def test_study_runs_controls_and_gates(fitted, permissive_pipeline, tmp_path):
 
     # The manifest records that a non-model forecaster produced the numbers.
     manifest = study.manifest.to_dict()
-    assert manifest["design_version"] == "chronos2_hourly_v1"
+    assert manifest["design_version"] == "chronos2_hourly_v2"
     assert manifest["checkpoint_revision"] == (
         "95a9710e2596287d08352589f42634fa5abdf0a7"
     )
     assert any("no predictive content" in note for note in manifest["notes"])
     assert manifest["environment"]["packages"]["chronos-forecasting"] == "absent"
 
+    # The primary information test (amended section 14) runs beside the gates,
+    # on the rows and dates C256 and B0 both scored, at the promotion confidence.
+    information = study.information
+    assert information is not None
+    assert information.baseline == "B0" and information.candidates == ("C256",)
+    assert information.series["C256"].sessions == information.series["B0"].sessions
+    assert information.confidence == (
+        permissive_pipeline.config.validation.promotion_bootstrap_confidence
+    )
+
     report = render_markdown(study)
     assert "RESEARCH / UNVALIDATED" in report
     assert "Origins with no alert" in report
     assert "Promotion gates" in report
+    assert "**Adds information beyond B0:**" in report
+    assert "## Primary information test: rank IC against B0" in report
 
     written = study.write(tmp_path / "study.json")
     assert written.is_file()
@@ -235,6 +247,8 @@ def test_study_runs_controls_and_gates(fitted, permissive_pipeline, tmp_path):
     payload = json.loads(written.read_text(encoding="utf-8"))
     assert payload["gates"]["passed"] is False
     assert payload["trade_metrics"]["origins_scanned"] > 0
+    assert payload["information_test"]["criterion"] == "daily_rank_ic_candidate_minus_b0"
+    assert payload["information_demonstrated"] is study.information_demonstrated
 
 
 def test_study_refuses_a_schedule_without_folds(permissive_pipeline, calendar, config):

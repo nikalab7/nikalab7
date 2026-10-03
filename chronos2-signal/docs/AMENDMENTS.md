@@ -12,6 +12,74 @@ research version needs genuinely new evaluation dates.
 | Date | design_version | Change | Reason |
 | --- | --- | --- | --- |
 | 2026-09-27 | `chronos2_hourly_v1` | Initial registration | Protocol frozen before implementation |
+| 2026-10-03 | `chronos2_hourly_v2` | The daily rank-IC gain over B0 becomes the primary criterion for "does Chronos-2 add information", in development selection (section 12) and in the final test (section 14). Trading thresholds, the portfolio and all eight gates are unchanged | The registered portfolio test cannot detect a realistic edge at these sample sizes; see below |
+
+## `chronos2_hourly_v2` — 3 October 2026
+
+**Decided before any real outcome was examined.** No market data has been downloaded
+and no Chronos-2 forecast produced. The decision rests only on synthetic positive
+controls and simulation ([ANALYSIS.md](ANALYSIS.md)); the protocol owner chose this
+option among the four that analysis listed.
+
+**What changed.** Section 12's development selection rule read:
+
+> Development selection: require at least 40 executed development-validation trades
+> across 25 distinct signal sessions, positive base/stress net returns, and no
+> dependence on one lucky outlier. Rank eligible Chronos candidates by the 90%
+> date-block-bootstrap lower bound of mean daily reference-portfolio net return. If
+> differences are inconclusive, retain C256 for continued research, without declaring
+> it superior. A candidate must also show useful incremental evidence over B0; if not,
+> do not claim a Transformer edge.
+
+It now ranks candidates by the 90% paired date-block-bootstrap lower bound of the mean
+daily rank-IC gain over B0, on the rows every compared system scored. Eligibility is at
+least 25 such dates, a positive mean gain, and a gain that survives removing the single
+best date. The no-winner rule is kept: if the leader is not separated from the
+runner-up, C256 is retained without being declared superior. Section 14 gains the
+primary information test that defines the statistic, at 90% in development and 95% in
+the final test. A claim also needs the frozen checkpoint to have produced the
+forecasts: a test fixture's result is reported, never credited to Chronos-2. The full
+text is in [DESIGN.md](DESIGN.md), marked in place.
+
+Three keys are added to `validation` in `config/design.yaml`:
+`information_criterion: daily_rank_ic_candidate_minus_b0`,
+`information_min_common_rows_per_date: 3` and `development_min_information_dates: 25`.
+The loader rejects any other criterion, and rejects a configuration whose
+`design_version` is not the one the code implements.
+
+**What did not change.** Every feature, threshold, hyperparameter, cost, the alert
+policy, the reference portfolio, the chronology, the bootstrap settings and all eight
+promotion gates. The trading floors of section 12 are still computed and reported for
+every candidate. A trading claim — the qualified label — still needs every gate.
+
+**Why.** The original rule asked whether Chronos-2 adds information through a
+three-position portfolio with a two-session hold. At the registered sample sizes that
+test can barely detect even an extraordinary edge: a true +0.40% net per trade clears
+the development bound about one time in four and the final test about one in five.
+Scoring every eligible stock every date uses the same dates far more efficiently.
+Power of the adopted test (simulated, 50 names per date; the gain is the realised mean
+daily IC difference):
+
+| Mean daily IC gain over B0 | Development, 40 dates, 90% | Final test, 60 dates, 95% |
+| --- | --- | --- |
+| none planted (−0.004 realised) | 3% | 2% |
+| +0.013 | 15% | 12% |
+| +0.026 | 35% | 32% |
+| +0.042 | 68% | 70% |
+| +0.069 | 95% | 97% |
+
+These numbers assume 50 names; a smaller watchlist has less power. At a gain of exactly
+zero the nominal false-positive rates are 5% in development and 2.5% in the final test;
+the first row is a candidate slightly worse than B0. `analysis/power_ic_difference.py`
+reproduces them.
+
+**What this does not buy.** Information is not profit. A candidate can rank stocks
+better than B0 and still lose money after costs, or never reach the alert thresholds;
+the report then says exactly that. Section 14's "Transformer-specific alpha" still needs
+gate 4's incremental portfolio evidence.
+
+**Effect on earlier results.** None exist: no result was produced under
+`chronos2_hourly_v1`.
 
 ## Not amendments
 
@@ -52,6 +120,14 @@ amendment.
   use the folds' fit/purge/calibration recipe, which section 13 requires ("the same
   fit/purge/calibration recipe"), and the 5/20-session bootstrap sensitivity of section
   14 is now computed. Both bring the implementation to the registered text.
+- **No interval from fewer than two blocks** (3 October 2026). Section 14's moving-block
+  bootstrap cannot vary on a series that holds a single block: every replicate is the
+  series itself, and the interval collapsed onto the point estimate. A zero-width
+  interval reads as certainty, so a fixture with no information was "demonstrated" on a
+  ten-date test. A series shorter than two full blocks now gets no interval, and every
+  rule that reads a bound fails closed. The registered sample sizes are unaffected: 40
+  development dates and 60 test origins are at least two blocks at every registered
+  block length (5, 10 and 20 sessions).
 
 ## Clarification that departs from the letter of the text
 

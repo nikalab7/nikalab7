@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "chronos2-signal"
 version = "0.1.0"
-description = "Free-data, long-only research scanner for a frozen US watchlist (design chronos2_hourly_v1, unvalidated)"
+description = "Free-data, long-only research scanner for a frozen US watchlist (design chronos2_hourly_v2, unvalidated)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }

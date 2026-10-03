@@ -50,7 +50,7 @@ __all__ = ["__version__", "DESIGN_VERSION", "STATUS", "load_design"]
 __version__ = "0.1.0"
 
 #: The registered protocol version this code implements.
-DESIGN_VERSION = "chronos2_hourly_v1"
+DESIGN_VERSION = "chronos2_hourly_v2"
 
 #: Short, deliberately blunt statement of what this package has established.
 STATUS = (

@@ -25,6 +25,8 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
+from .config import INFORMATION_CRITERION
+
 __all__ = [
     "EvaluationError",
     "TradeRecord",
@@ -42,6 +44,10 @@ __all__ = [
     "LabelledPrediction",
     "PredictiveReport",
     "predictive_report",
+    "ranking_score",
+    "common_rank_ic_series",
+    "InformationTest",
+    "information_test",
     "block_profitability",
     "contributor_concentration",
     "GateResult",
@@ -270,6 +276,17 @@ def _block_indices(
     return indices[:, :n]
 
 
+def _resamplable(n: int, block: int) -> bool:
+    """Whether ``n`` sessions hold the two full blocks an interval needs.
+
+    With a single block every replicate is the series itself, and with barely
+    more than one the replicates are near-copies of it: the interval collapses
+    onto the point estimate and reads as certainty. Such a series gets no
+    interval, and every rule that reads a bound fails closed.
+    """
+    return n >= 2 * max(1, block)
+
+
 def moving_block_bootstrap(
     series: DailySeries,
     *,
@@ -278,12 +295,20 @@ def moving_block_bootstrap(
     confidence: float,
     seed: int = 20260927,
 ) -> BootstrapEstimate:
-    """Interval for the mean daily net return of one system."""
-    rng = np.random.default_rng(seed)
-    indices = _block_indices(len(series), block_sessions, samples, rng)
-    means = series.returns[indices].mean(axis=1)
-    alpha = (1.0 - confidence) / 2.0
-    lower, upper = np.quantile(means, [alpha, 1.0 - alpha])
+    """Interval for the mean daily net return of one system.
+
+    A series shorter than two blocks gets ``NaN`` bounds rather than an interval
+    of zero width.
+    """
+    if not len(series):
+        raise EvaluationError("cannot bootstrap an empty series")
+    lower = upper = float("nan")
+    if _resamplable(len(series), block_sessions):
+        rng = np.random.default_rng(seed)
+        indices = _block_indices(len(series), block_sessions, samples, rng)
+        means = series.returns[indices].mean(axis=1)
+        alpha = (1.0 - confidence) / 2.0
+        lower, upper = np.quantile(means, [alpha, 1.0 - alpha])
     return BootstrapEstimate(
         name=series.name,
         point=series.mean,
@@ -315,6 +340,9 @@ def paired_block_bootstrap(
     momentum control, against its own exposure-matched benchmark -- because
     each answers a different question, and a single reference system cannot
     ask all of them.
+
+    On a date index shorter than two blocks every bound is ``NaN``: there is
+    no resampling variability to build an interval from.
     """
     if not systems:
         return {}
@@ -331,21 +359,32 @@ def paired_block_bootstrap(
         )
 
     n = len(systems[0])
-    rng = np.random.default_rng(seed)
-    indices = _block_indices(n, block_sessions, samples, rng)
+    if n <= 0:
+        raise EvaluationError("cannot bootstrap an empty series")
+    resamplable = _resamplable(n, block_sessions)
+    if resamplable:
+        rng = np.random.default_rng(seed)
+        indices = _block_indices(n, block_sessions, samples, rng)
     alpha = (1.0 - confidence) / 2.0
+    nan = float("nan")
+
+    def bounds(means: np.ndarray | None) -> tuple[float, float]:
+        if means is None:
+            return nan, nan
+        lower, upper = np.quantile(means, [alpha, 1.0 - alpha])
+        return float(lower), float(upper)
 
     estimates: dict[str, BootstrapEstimate] = {}
-    replicate_means: dict[str, np.ndarray] = {}
+    replicate_means: dict[str, np.ndarray | None] = {}
     for system in systems:
-        means = system.returns[indices].mean(axis=1)
+        means = system.returns[indices].mean(axis=1) if resamplable else None
         replicate_means[system.name] = means
-        lower, upper = np.quantile(means, [alpha, 1.0 - alpha])
+        lower, upper = bounds(means)
         estimates[system.name] = BootstrapEstimate(
             name=system.name,
             point=system.mean,
-            lower=float(lower),
-            upper=float(upper),
+            lower=lower,
+            upper=upper,
             confidence=confidence,
             block_sessions=block_sessions,
             samples=samples,
@@ -358,14 +397,15 @@ def paired_block_bootstrap(
                 raise EvaluationError(f"system {name!r} was not supplied to the bootstrap")
         if left == right:
             raise EvaluationError(f"cannot difference {left!r} against itself")
-        difference = replicate_means[left] - replicate_means[right]
-        lower, upper = np.quantile(difference, [alpha, 1.0 - alpha])
+        first, second = replicate_means[left], replicate_means[right]
+        difference = None if first is None or second is None else first - second
+        lower, upper = bounds(difference)
         key = f"{left}_minus_{right}"
         estimates[key] = BootstrapEstimate(
             name=key,
             point=estimates[left].point - estimates[right].point,
-            lower=float(lower),
-            upper=float(upper),
+            lower=lower,
+            upper=upper,
             confidence=confidence,
             block_sessions=block_sessions,
             samples=samples,
@@ -670,6 +710,182 @@ def predictive_report(
         persistence_abs_error=persistence_error,
         rank_ic_mean=float(np.mean(finite_ics)) if finite_ics else nan,
         rank_ic_dates=len(finite_ics),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# The primary information test (design chronos2_hourly_v2)
+# --------------------------------------------------------------------------- #
+
+
+def ranking_score(row: LabelledPrediction) -> float:
+    """The registered ranking score: estimated net return over ``sigma_2d``."""
+    if (
+        not math.isfinite(row.estimated_net_return)
+        or not math.isfinite(row.sigma_2d)
+        or row.sigma_2d <= 0.0
+    ):
+        return float("nan")
+    return row.estimated_net_return / row.sigma_2d
+
+
+def common_rank_ic_series(
+    rows_by_system: Mapping[str, Sequence[LabelledPrediction]],
+    *,
+    min_rows: int,
+) -> dict[str, DailySeries]:
+    """Each system's daily cross-sectional rank IC, on the rows all of them scored.
+
+    On every date only the symbols that every system scored -- with a finite
+    ranking score and a realised outcome -- enter, so a difference between two
+    systems' ICs measures ranking skill on identical rows, not on different
+    samples. A date with fewer than ``min_rows`` such symbols, or on which any
+    system's IC is undefined, is dropped for every system alike, which keeps one
+    shared date index for the paired bootstrap. The returned series hold daily
+    ICs in the ``returns`` field.
+    """
+    tables: dict[str, dict[dt.date, dict[str, tuple[float, float]]]] = {}
+    for name, rows in rows_by_system.items():
+        table: dict[dt.date, dict[str, tuple[float, float]]] = {}
+        for row in rows:
+            score = ranking_score(row)
+            if math.isfinite(score) and math.isfinite(row.r_net):
+                table.setdefault(row.origin_session, {})[row.symbol] = (score, row.r_net)
+        tables[name] = table
+    names = list(rows_by_system)
+    if not names:
+        return {}
+    shared_dates = sorted(set.intersection(*(set(table) for table in tables.values())))
+    kept: list[dt.date] = []
+    values: dict[str, list[float]] = {name: [] for name in names}
+    for session in shared_dates:
+        common = sorted(set.intersection(*(set(tables[name][session]) for name in names)))
+        if len(common) < min_rows:
+            continue
+        ics = {
+            name: spearman_correlation(
+                [tables[name][session][symbol][0] for symbol in common],
+                [tables[name][session][symbol][1] for symbol in common],
+            )
+            for name in names
+        }
+        if not all(math.isfinite(value) for value in ics.values()):
+            continue
+        kept.append(session)
+        for name in names:
+            values[name].append(ics[name])
+    return {
+        name: DailySeries(name=name, sessions=tuple(kept), returns=np.asarray(values[name], dtype=float))
+        for name in names
+    }
+
+
+@dataclass(frozen=True)
+class InformationTest:
+    """Does a candidate rank stocks better than the baseline, on the same rows?
+
+    The primary criterion of design ``chronos2_hourly_v2`` for the research
+    question "does Chronos-2 add information beyond B0?". It is a claim about
+    ranking skill, not about trading: a trading claim still needs every
+    promotion gate.
+
+    Attributes:
+        series: Each system's daily rank IC on the common rows and dates.
+        bootstrap: Paired date-block intervals for each system's mean IC and for
+            every registered difference, named ``"<a>_minus_<b>"``.
+    """
+
+    baseline: str
+    candidates: tuple[str, ...]
+    series: Mapping[str, DailySeries]
+    bootstrap: Mapping[str, BootstrapEstimate]
+    confidence: float
+    min_rows: int
+
+    @property
+    def dates(self) -> int:
+        baseline = self.series.get(self.baseline)
+        return len(baseline.sessions) if baseline is not None else 0
+
+    def mean_ic(self, name: str) -> float:
+        series = self.series.get(name)
+        return float(series.returns.mean()) if series is not None and series.returns.size else float("nan")
+
+    def gain(self, candidate: str) -> BootstrapEstimate | None:
+        """The interval for the candidate's mean daily IC minus the baseline's."""
+        return self.bootstrap.get(f"{candidate}_minus_{self.baseline}")
+
+    def gain_excluding_best_date(self, candidate: str) -> float:
+        """The mean daily IC gain with the single most favourable date removed."""
+        if candidate not in self.series or self.baseline not in self.series:
+            return float("nan")
+        gains = self.series[candidate].returns - self.series[self.baseline].returns
+        if gains.size < 2:
+            return float("nan")
+        return float(np.delete(gains, int(np.argmax(gains))).mean())
+
+    def demonstrated(self, candidate: str) -> bool:
+        """Whether the gain's lower bound is above zero at this test's confidence."""
+        estimate = self.gain(candidate)
+        return bool(estimate is not None and estimate.excludes_zero_above)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "criterion": INFORMATION_CRITERION,
+            "baseline": self.baseline,
+            "candidates": list(self.candidates),
+            "dates": self.dates,
+            "min_common_rows_per_date": self.min_rows,
+            "confidence": self.confidence,
+            "mean_ic": {name: self.mean_ic(name) for name in self.series},
+            "bootstrap": {name: estimate.to_dict() for name, estimate in self.bootstrap.items()},
+            "gain_excluding_best_date": {
+                name: self.gain_excluding_best_date(name) for name in self.candidates
+            },
+            "demonstrated": {name: self.demonstrated(name) for name in self.candidates},
+        }
+
+
+def information_test(
+    rows_by_system: Mapping[str, Sequence[LabelledPrediction]],
+    *,
+    baseline: str,
+    min_rows: int,
+    block_sessions: int,
+    samples: int,
+    confidence: float,
+    seed: int = 20260927,
+) -> InformationTest:
+    """The paired date-block test of rank IC, every candidate against ``baseline``.
+
+    One shared resampling of dates serves every system, as in the portfolio
+    comparison, so each difference is paired: the same dates, the same rows.
+    Differences between candidates are included so that a development leader
+    can be separated from its runner-up.
+    """
+    if baseline not in rows_by_system:
+        raise EvaluationError(f"baseline {baseline!r} was not supplied to the information test")
+    candidates = tuple(name for name in rows_by_system if name != baseline)
+    series = common_rank_ic_series(rows_by_system, min_rows=min_rows)
+    differences = [(name, baseline) for name in candidates]
+    differences += [(a, b) for a in candidates for b in candidates if a != b]
+    bootstrap: dict[str, BootstrapEstimate] = {}
+    if series and len(series[baseline].sessions):
+        bootstrap = paired_block_bootstrap(
+            list(series.values()),
+            block_sessions=block_sessions,
+            samples=samples,
+            confidence=confidence,
+            differences=differences,
+            seed=seed,
+        )
+    return InformationTest(
+        baseline=baseline,
+        candidates=candidates,
+        series=series,
+        bootstrap=bootstrap,
+        confidence=confidence,
+        min_rows=min_rows,
     )
 
 

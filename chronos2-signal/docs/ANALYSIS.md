@@ -103,7 +103,8 @@ test on the mean daily cross-sectional rank IC (50 names per date):
 | 0.05 | 68% | 70% |
 | 0.10 | 99% | 100% |
 
-The pipeline already computes this IC, but only as a diagnostic.
+When this analysis was written, the pipeline computed this IC only as a diagnostic. It
+is now the primary criterion (section 5).
 
 ## 4. Options for the protocol owner
 
@@ -126,3 +127,36 @@ is examined**. None has been, so each is still legitimate.
 
 These are not mutually exclusive; 1 and 3 together address the research question
 without loosening anything a trading claim depends on.
+
+## 5. Decision: option 1, registered as `chronos2_hourly_v2`
+
+On 3 October 2026, still before any real outcome had been examined, the protocol owner
+chose option 1. The amendment is recorded in [AMENDMENTS.md](AMENDMENTS.md) and marked
+in place in sections 12 and 14 of [DESIGN.md](DESIGN.md). Options 2–4 were not adopted:
+the alert rule, the forward period and every gate stay as registered.
+
+The test that was adopted is a *difference*: each date's rank IC for the candidate
+minus B0's, on the rows both scored. The table in section 3 is for a single system's IC
+against zero, so the power of the adopted test was simulated separately
+(`analysis/power_ic_difference.py`, 50 names per date):
+
+| Mean daily IC gain over B0 | Development, 40 dates, 90% | Final test, 60 dates, 95% |
+| --- | --- | --- |
+| none planted (−0.004 realised) | 3% | 2% |
+| +0.013 | 15% | 12% |
+| +0.026 | 35% | 32% |
+| +0.042 | 68% | 70% |
+| +0.069 | 95% | 97% |
+
+With nothing planted the candidate's extra noise makes it slightly worse than B0, and it
+passes 2–3% of the time; at a gain of exactly zero the nominal rates are 5% in
+development (the lower end of a 90% interval) and 2.5% in the final test. The test finds
+a gain of about 0.04 roughly two times in three, where the portfolio test needed an edge
+near +0.70% per trade to do as well as one time in two.
+
+An end-to-end positive control of the adopted test is now part of the test suite. A
+fixture forecaster that reads the realised future gives C256 information that B0 cannot
+have. The development comparison selects C256 on its rank-IC gain, the final test
+separates that gain from zero, and both still claim nothing for Chronos-2, because a
+fixture produced the forecasts
+(`test_the_information_test_detects_information_b0_cannot_have`).

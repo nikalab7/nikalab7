@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+from . import DESIGN_VERSION
 from .calendar_spec import CALENDAR_CHANNEL_NAMES, ExchangeCalendar
 from .config import ConfigError, load_design
 from .features import CHRONOS_CHANNEL_NAMES, FEATURE_NAMES, PREPROCESSING_COLUMNS
@@ -35,7 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="chronos2-signal",
         description=(
             "Free-data, long-only research scanner for a frozen US watchlist. "
-            "Design chronos2_hourly_v1, unvalidated: no edge is claimed."
+            f"Design {DESIGN_VERSION}, unvalidated: no edge is claimed."
         ),
     )
     # The global options are also attached to every subcommand, so both

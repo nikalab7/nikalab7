@@ -23,10 +23,13 @@ from typing import Any, Mapping, Sequence, get_args, get_origin, get_type_hints
 
 import yaml
 
+from . import DESIGN_VERSION
+
 __all__ = [
     "ConfigError",
     "VALIDATED_STATUSES",
     "KNOWN_STATUSES",
+    "INFORMATION_CRITERION",
     "DataConfig",
     "UniverseConfig",
     "ModelConfig",
@@ -40,6 +43,11 @@ __all__ = [
     "load_design",
     "default_config_path",
 ]
+
+
+#: The primary criterion this code implements for "does Chronos-2 add
+#: information beyond B0?" (sections 12 and 14 as amended in chronos2_hourly_v2).
+INFORMATION_CRITERION = "daily_rank_ic_candidate_minus_b0"
 
 
 class ConfigError(ValueError):
@@ -189,6 +197,9 @@ class ValidationConfig:
     combined_evaluation_min_signal_sessions: int
     development_min_executed_trades: int
     development_min_signal_sessions: int
+    information_criterion: str
+    information_min_common_rows_per_date: int
+    development_min_information_dates: int
     development_selection_bootstrap_confidence: float
     promotion_bootstrap_confidence: float
     promotion_min_profitable_blocks: int
@@ -301,8 +312,17 @@ def load_design(path: str | Path | None = None) -> DesignConfig:
             raise ConfigError(f"section {name!r} must be a mapping")
         sections[name] = _build(cls, block, name)
 
+    design_version = str(raw["design_version"])
+    if design_version != DESIGN_VERSION:
+        # The code implements one registered protocol. Running it against a
+        # configuration registered for another would apply one version's rules
+        # to the other's thresholds.
+        raise ConfigError(
+            f"configuration declares design version {design_version!r}, but this code "
+            f"implements {DESIGN_VERSION!r}"
+        )
     config = DesignConfig(
-        design_version=str(raw["design_version"]),
+        design_version=design_version,
         status=str(raw["status"]),
         source_path=config_path,
         **sections,
@@ -516,6 +536,18 @@ def _validate(config: DesignConfig) -> None:
             "validation.initial_learned_variants must be exactly the five registered "
             "variants; a new variant needs a new design version"
         )
+    if validation.information_criterion != INFORMATION_CRITERION:
+        raise ConfigError(
+            f"validation.information_criterion must be {INFORMATION_CRITERION!r}; "
+            "a different primary criterion needs a new design version"
+        )
+    if validation.information_min_common_rows_per_date < 3:
+        raise ConfigError(
+            "validation.information_min_common_rows_per_date must be at least 3: a rank "
+            "correlation needs three rows"
+        )
+    if validation.development_min_information_dates < 1:
+        raise ConfigError("validation.development_min_information_dates must be positive")
     if not 0.0 < validation.development_selection_bootstrap_confidence < 1.0:
         raise ConfigError("development selection confidence must lie in (0, 1)")
     if not 0.0 < validation.promotion_bootstrap_confidence < 1.0:

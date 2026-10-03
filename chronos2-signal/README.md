@@ -72,7 +72,7 @@ own report says that its numbers describe a seeded random walk.
 pytest -q
 ```
 
-105 tests, fully offline. The twelve integrity invariants of the protocol's section 16
+110 tests, fully offline. The twelve integrity invariants of the protocol's section 16
 are in `tests/test_invariants.py` and are mapped to what they protect in
 [`docs/INVARIANTS.md`](docs/INVARIANTS.md). Among other things they prove that
 appending future prices cannot change an earlier origin's features, that a split
@@ -158,8 +158,17 @@ analysis/             positive control, edge ceiling and power experiments behin
 Before any data is examined, [`docs/ANALYSIS.md`](docs/ANALYSIS.md) asks whether the
 experiment can produce a credible positive result. A planted-edge positive control shows
 the pipeline finds a large edge end to end; a power analysis shows that under the
-registered rules a realistic edge yields no alerts and cannot be confirmed by the
-60-origin test. The options for that are the protocol owner's decision.
+original rules a realistic edge yields no alerts and cannot be confirmed by the
+60-origin test.
+
+The protocol owner therefore registered amendment `chronos2_hourly_v2`
+([`docs/AMENDMENTS.md`](docs/AMENDMENTS.md)), still before any real outcome was seen.
+Whether Chronos-2 adds information beyond B0 is now decided by the paired date-block
+bootstrap of the daily cross-sectional rank-IC gain over B0, on the rows every compared
+system scored. Every report leads with that verdict. The alert rule, the portfolio and all
+eight promotion gates are unchanged, so a trading claim needs exactly what it needed
+before. A result produced with a fixture forecaster is reported but never credited to
+Chronos-2.
 
 ## Limitations that implementation cannot fix
 

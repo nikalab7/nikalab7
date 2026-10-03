@@ -40,11 +40,13 @@ from .evaluation import (
     BootstrapEstimate,
     DailySeries,
     GateReport,
+    InformationTest,
     LabelledPrediction,
     PredictiveReport,
     block_profitability,
     contributor_concentration,
     evaluate_promotion_gates,
+    information_test,
     paired_block_bootstrap,
     predictive_report,
     trade_metrics,
@@ -538,6 +540,24 @@ def _sensitivity_dict(sensitivity: Mapping[int, Mapping[str, BootstrapEstimate]]
     }
 
 
+def _information_test(
+    config: DesignConfig,
+    labelled: Mapping[str, Sequence[LabelledPrediction]],
+    *,
+    samples: int,
+    confidence: float,
+) -> InformationTest:
+    """The registered primary information test: every candidate against B0."""
+    return information_test(
+        labelled,
+        baseline="B0",
+        min_rows=config.validation.information_min_common_rows_per_date,
+        block_sessions=config.validation.bootstrap_block_sessions,
+        samples=samples,
+        confidence=confidence,
+    )
+
+
 def _verify_holdout(
     schedule: ProtocolSchedule,
     cache: Mapping[tuple[str, dt.date], OriginBatch],
@@ -574,11 +594,20 @@ def _verify_holdout(
 
 @dataclass(frozen=True)
 class SelectionDecision:
-    """The outcome of the section-12 development selection rule.
+    """The outcome of the section-12 development selection rule (amended in v2).
 
     ``selected`` is ``None`` whenever the evidence does not single out one
     candidate. That is a permitted, recorded result -- and in that case C256 is
     retained for continued research *without* being declared superior.
+
+    Attributes:
+        eligibility: Per candidate, why it may not be selected under the
+            information criterion; empty when it is eligible.
+        trading_floors: Per candidate, which trading floors it misses. Reported
+            beside the selection; since ``chronos2_hourly_v2`` they do not select.
+        transformer_edge_claimable: Whether development evidence shows the
+            selected candidate adding information beyond B0, from forecasts the
+            frozen checkpoint produced.
     """
 
     selected: str | None
@@ -587,6 +616,7 @@ class SelectionDecision:
     eligibility: Mapping[str, tuple[str, ...]]
     ranking: tuple[tuple[str, float], ...]
     statement: str
+    trading_floors: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -596,6 +626,9 @@ class SelectionDecision:
             "eligibility": {name: list(reasons) for name, reasons in self.eligibility.items()},
             "ranking": [list(item) for item in self.ranking],
             "statement": self.statement,
+            "trading_floors": {
+                name: list(reasons) for name, reasons in self.trading_floors.items()
+            },
         }
 
 
@@ -615,10 +648,13 @@ class ComparisonResult:
     bootstrap_sensitivity: Mapping[int, Mapping[str, BootstrapEstimate]] = field(
         default_factory=dict
     )
+    #: The primary information test (amended section 12) that made the selection.
+    information: InformationTest | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
             "variants": list(self.variants),
+            "information_test": self.information.to_dict() if self.information else None,
             "folds": list(self.folds),
             "systems": {name: result.summary() for name, result in self.systems.items()},
             "trade_metrics": {
@@ -649,63 +685,70 @@ class ComparisonResult:
 def select_candidate(
     *,
     config: DesignConfig,
+    information: InformationTest,
     systems: Mapping[str, BacktestResult],
-    bootstrap: Mapping[str, BootstrapEstimate],
 ) -> SelectionDecision:
-    """Apply the section-12 development selection rule.
+    """Apply the section-12 development selection rule, as amended in v2.
 
-    1. A Chronos candidate is eligible only with at least the registered number
-       of executed trades across the registered number of distinct sessions,
-       positive mean net return at base *and* stress costs, and profit that
-       survives removing the single best trade.
-    2. Eligible candidates are ranked by the 90% lower bound of their mean daily
-       reference-portfolio net return.
-    3. If the difference between the leader and the runner-up is inconclusive,
-       there is no winner and C256 is retained for continued research without
-       being declared superior. Section 12 sets no further condition on the
-       leader's own lower bound: whether its return is credibly positive is the
-       final test's question, not the selection's.
-    4. A Transformer edge is claimable only if the winner also beats B0.
+    The question is whether a Chronos candidate ranks stocks better than B0, so
+    it is answered with the paired information test rather than with the
+    three-position portfolio, which cannot answer it at these sample sizes.
+
+    1. A Chronos candidate is eligible with at least the registered number of
+       development dates carrying common rows, a positive mean daily rank-IC
+       gain over B0, and a gain that survives removing its single best date.
+    2. Eligible candidates are ranked by the 90% date-block-bootstrap lower bound
+       of that gain.
+    3. If the leader's IC advantage over the runner-up is inconclusive, there is
+       no winner and C256 is retained for continued research without being
+       declared superior.
+    4. Development evidence that Chronos-2 adds information requires the
+       selected candidate's lower bound against B0 to be above zero -- and the
+       frozen checkpoint to have produced its forecasts. A fixture's numbers
+       are plumbing, whatever they show.
+
+    The trading floors are still computed for every candidate and reported;
+    they no longer select.
     """
     validation = config.validation
     candidates = [
         name
-        for name in systems
+        for name in information.candidates
         if name in REGISTERED_VARIANTS and REGISTERED_VARIANTS[name].uses_forecast
     ]
     eligibility: dict[str, tuple[str, ...]] = {}
     for name in candidates:
-        result = systems[name]
-        metrics = trade_metrics(result.trades, origins_scanned=result.origins_scanned)
         reasons: list[str] = []
-        if metrics.trades < validation.development_min_executed_trades:
+        if information.dates < validation.development_min_information_dates:
             reasons.append(
-                f"{metrics.trades} executed trades, fewer than "
-                f"{validation.development_min_executed_trades}"
+                f"{information.dates} development dates with "
+                f"{information.min_rows}+ common rows, fewer than "
+                f"{validation.development_min_information_dates}"
             )
-        if metrics.distinct_sessions < validation.development_min_signal_sessions:
+        gain = information.gain(name)
+        if gain is None or not gain.point > 0.0:
+            reasons.append("mean daily rank-IC gain over B0 is not positive")
+        if not information.gain_excluding_best_date(name) > 0.0:
+            reasons.append("the gain does not survive removing the single best date")
+        if gain is not None and not math.isfinite(gain.lower):
             reasons.append(
-                f"{metrics.distinct_sessions} distinct signal sessions, fewer than "
-                f"{validation.development_min_signal_sessions}"
+                f"{gain.n_sessions} dates are too few to resample in "
+                f"{gain.block_sessions}-session blocks"
             )
-        if not (metrics.mean_net_return > 0.0):
-            reasons.append("mean net return at base costs is not positive")
-        if not (metrics.stress_mean_net_return > 0.0):
-            reasons.append("mean net return at stress costs is not positive")
-        if not contributor_concentration(list(result.trades)).get(
-            "profitable_excluding_best_trade"
-        ):
-            reasons.append("profit does not survive removing the single best trade")
         eligibility[name] = tuple(reasons)
+
+    trading_floors = {
+        name: _trading_floor_failures(config, systems[name]) for name in candidates if name in systems
+    }
 
     eligible = [name for name in candidates if not eligibility[name]]
     ranking = tuple(
         sorted(
-            ((name, bootstrap[name].lower) for name in eligible),
+            ((name, information.gain(name).lower) for name in eligible),  # type: ignore[union-attr]
             key=lambda item: (-item[1], item[0]),
         )
     )
-    confidence = f"{validation.development_selection_bootstrap_confidence:.0%}"
+    confidence = f"{information.confidence:.0%}"
 
     def no_winner(statement: str) -> SelectionDecision:
         return SelectionDecision(
@@ -716,36 +759,78 @@ def select_candidate(
             ranking=ranking,
             statement=statement
             + " C256 is retained for continued research without being declared superior.",
+            trading_floors=trading_floors,
         )
 
     if not eligible:
-        return no_winner("No Chronos candidate met the development floors.")
+        return no_winner("No Chronos candidate met the information criterion's floors.")
     leader = ranking[0][0]
     if len(ranking) > 1:
         runner_up = ranking[1][0]
-        gap = bootstrap.get(f"{leader}_minus_{runner_up}")
+        gap = information.bootstrap.get(f"{leader}_minus_{runner_up}")
         if gap is None or not gap.lower > 0.0:
             return no_winner(
-                f"{leader} and {runner_up} are not distinguishable at {confidence}."
+                f"{leader} and {runner_up} rank stocks indistinguishably well at "
+                f"{confidence}."
             )
-    versus_b0 = bootstrap.get(f"{leader}_minus_B0")
-    edge = bool(versus_b0 is not None and versus_b0.lower > 0.0)
+    separated = information.demonstrated(leader)
+    from_checkpoint = leader in systems and _from_checkpoint(systems[leader])
+    if separated and from_checkpoint:
+        conclusion = (
+            "That lower bound is above zero: development evidence that Chronos-2 adds "
+            "information, for the final test to confirm."
+        )
+    elif separated:
+        conclusion = (
+            "That lower bound is above zero, but a test fixture rather than the frozen "
+            "checkpoint produced the forecasts, so nothing is claimed for Chronos-2."
+        )
+    else:
+        conclusion = (
+            "That lower bound is not above zero, so no Chronos-specific information is "
+            "claimed."
+        )
     return SelectionDecision(
         selected=leader,
         retained_for_research=leader,
-        transformer_edge_claimable=edge,
+        transformer_edge_claimable=separated and from_checkpoint,
         eligibility=eligibility,
         ranking=ranking,
         statement=(
-            f"{leader} selected on its {confidence} lower bound. "
-            + (
-                "It also beats B0 at that confidence."
-                if edge
-                else "It does not beat B0 at that confidence, so no Transformer-specific "
-                "edge is claimed."
-            )
+            f"{leader} selected on the {confidence} lower bound of its rank-IC gain over "
+            f"B0. {conclusion}"
         ),
+        trading_floors=trading_floors,
     )
+
+
+def _from_checkpoint(result: BacktestResult) -> bool:
+    """Whether the frozen checkpoint, not a fixture, produced a run's forecasts."""
+    return result.forecaster_provenance.get("is_frozen_checkpoint") is True
+
+
+def _trading_floor_failures(config: DesignConfig, result: BacktestResult) -> tuple[str, ...]:
+    """Which section-12 trading floors a development system misses. Reported only."""
+    validation = config.validation
+    metrics = trade_metrics(result.trades, origins_scanned=result.origins_scanned)
+    reasons: list[str] = []
+    if metrics.trades < validation.development_min_executed_trades:
+        reasons.append(
+            f"{metrics.trades} executed trades, fewer than "
+            f"{validation.development_min_executed_trades}"
+        )
+    if metrics.distinct_sessions < validation.development_min_signal_sessions:
+        reasons.append(
+            f"{metrics.distinct_sessions} distinct signal sessions, fewer than "
+            f"{validation.development_min_signal_sessions}"
+        )
+    if not (metrics.mean_net_return > 0.0):
+        reasons.append("mean net return at base costs is not positive")
+    if not (metrics.stress_mean_net_return > 0.0):
+        reasons.append("mean net return at stress costs is not positive")
+    if not contributor_concentration(list(result.trades)).get("profitable_excluding_best_trade"):
+        reasons.append("profit does not survive removing the single best trade")
+    return tuple(reasons)
 
 
 def run_development_comparison(
@@ -829,14 +914,18 @@ def run_development_comparison(
         confidence=config.validation.development_selection_bootstrap_confidence,
         differences=differences,
     )
+    labelled = {name: _label_predictions(guarded, systems[name].predictions) for name in names}
     predictive = {
-        name: predictive_report(
-            _label_predictions(guarded, systems[name].predictions),
-            quantile_levels=config.model.quantile_levels,
-        )
+        name: predictive_report(labelled[name], quantile_levels=config.model.quantile_levels)
         for name in names
     }
-    selection = select_candidate(config=config, systems=systems, bootstrap=bootstrap)
+    information = _information_test(
+        config,
+        labelled,
+        samples=bootstrap_samples or config.validation.bootstrap_samples,
+        confidence=config.validation.development_selection_bootstrap_confidence,
+    )
+    selection = select_candidate(config=config, information=information, systems=systems)
     holdout_note = _verify_holdout(
         schedule, cache, list(systems.values()), mode=AccessMode.DEVELOPMENT
     )
@@ -857,6 +946,7 @@ def run_development_comparison(
         selection=selection,
         manifest=manifest,
         bootstrap_sensitivity=sensitivity,
+        information=information,
         notes=(
             *notes,
             *_forecaster_notes(systems.values()),
@@ -892,6 +982,22 @@ class StudyResult:
     bootstrap_sensitivity: Mapping[int, Mapping[str, BootstrapEstimate]] = field(
         default_factory=dict
     )
+    #: The primary information test against B0 (amended section 14); ``None``
+    #: when the candidate is B0 itself.
+    information: InformationTest | None = None
+
+    @property
+    def information_demonstrated(self) -> bool:
+        """Whether this study shows the candidate adding information beyond B0.
+
+        Requires the frozen checkpoint to have produced the forecasts: with a
+        fixture the statistic is still reported, but nothing is claimed.
+        """
+        return bool(
+            self.information is not None
+            and self.information.demonstrated(self.variant)
+            and _from_checkpoint(self.candidate)
+        )
 
     def to_dict(self) -> dict[str, object]:
         metrics = trade_metrics(
@@ -901,6 +1007,8 @@ class StudyResult:
             "variant": self.variant,
             "checkpoint": self.checkpoint,
             "output_label": self.gates.status_label,
+            "information_test": self.information.to_dict() if self.information else None,
+            "information_demonstrated": self.information_demonstrated,
             "candidate": self.candidate.summary(),
             "baseline": self.baseline.summary() if self.baseline else None,
             "trade_metrics": metrics.to_dict(),
@@ -983,9 +1091,22 @@ def _assemble_study(
         confidence=config.validation.promotion_bootstrap_confidence,
         differences=differences,
     )
-    predictive = predictive_report(
-        _label_predictions(pipeline, candidate.predictions),
-        quantile_levels=config.model.quantile_levels,
+    candidate_rows = _label_predictions(pipeline, candidate.predictions)
+    predictive = predictive_report(candidate_rows, quantile_levels=config.model.quantile_levels)
+    # The primary research question, separate from the trading gates: does the
+    # candidate rank stocks better than B0 on the same rows and dates?
+    information = (
+        _information_test(
+            config,
+            {
+                candidate.variant: candidate_rows,
+                "B0": _label_predictions(pipeline, baseline.predictions),
+            },
+            samples=bootstrap_samples or config.validation.bootstrap_samples,
+            confidence=config.validation.promotion_bootstrap_confidence,
+        )
+        if baseline is not None
+        else None
     )
     controls = {momentum.daily.name: momentum.daily, matched.name: matched, cash.name: cash}
     baselines: dict[str, DailySeries] = dict(controls)
@@ -1034,6 +1155,7 @@ def _assemble_study(
         manifest=manifest,
         folds=tuple(folds),
         bootstrap_sensitivity=sensitivity,
+        information=information,
         notes=(
             # The caller's notes lead: a warning about what the data is belongs
             # at the top of what a reader looks at, not only in the manifest.
@@ -1218,11 +1340,13 @@ def render_markdown(result: StudyResult) -> str:
     lines = [
         f"# {result.variant} - {result.checkpoint}",
         "",
+        f"**Adds information beyond B0:** {_information_verdict(result)}",
         f"**Label:** {result.gates.status_label}",
         f"**Design:** {result.manifest.design_version} "
         f"(fingerprint `{result.manifest.design_fingerprint[:12]}`)",
         f"**Forecaster:** {result.candidate.forecaster_provenance.get('forecaster')}",
         "",
+        *_information_lines(result.information, result.variant),
         "## Coverage",
         "",
         f"- Origins scanned: {metrics.origins_scanned}",
@@ -1306,6 +1430,11 @@ def render_comparison_markdown(result: ComparisonResult) -> str:
         f"**Selection:** {selection.statement}",
         f"**Transformer edge claimable:** {selection.transformer_edge_claimable}",
         "",
+        *(
+            _information_lines(result.information, None)
+            if result.information is not None
+            else []
+        ),
         "## Systems on identical dates, fills and costs",
         "",
         "| System | Trades | Sessions | Mean net (base) | Mean net (stress) | Mean daily |",
@@ -1321,6 +1450,9 @@ def render_comparison_markdown(result: ComparisonResult) -> str:
     lines.extend(["", "## Eligibility for selection", ""])
     for name, reasons in selection.eligibility.items():
         lines.append(f"- {name}: {'eligible' if not reasons else '; '.join(reasons)}")
+    lines.extend(["", "## Trading floors (reported; since v2 they do not select)", ""])
+    for name, reasons in selection.trading_floors.items():
+        lines.append(f"- {name}: {'all met' if not reasons else '; '.join(reasons)}")
     lines.extend(["", "## Predictive diagnostics", ""])
     for name, report in result.predictive.items():
         lines.append(
@@ -1347,6 +1479,62 @@ def _alert_coverage(result: BacktestResult) -> dict[str, float | int]:
         "no_alert_origins": len(result.no_alert_origins),
         "alert_coverage": (with_alerts / result.origins_scanned) if result.origins_scanned else float("nan"),
     }
+
+
+def _information_verdict(result: StudyResult) -> str:
+    if result.information is None:
+        return "not tested (the candidate is B0)"
+    estimate = result.information.gain(result.variant)
+    if estimate is None:
+        return "not measurable (no dates with enough common rows)"
+    if not math.isfinite(estimate.lower):
+        return (
+            f"not measurable ({estimate.n_sessions} dates are too few to resample in "
+            f"{estimate.block_sessions}-session blocks)"
+        )
+    bound = (
+        f"{estimate.confidence:.0%} lower bound of the mean daily rank-IC gain: "
+        f"{_fmt(estimate.lower)}"
+    )
+    if result.information_demonstrated:
+        return f"demonstrated ({bound})"
+    if result.information.demonstrated(result.variant):
+        return f"not claimed: a test fixture produced the forecasts ({bound})"
+    return f"not demonstrated ({bound})"
+
+
+def _information_lines(information: InformationTest | None, only: str | None) -> list[str]:
+    """The primary information test, as report lines."""
+    if information is None:
+        return []
+    lines = [
+        "## Primary information test: rank IC against B0",
+        "",
+        f"- {information.dates} dates with at least {information.min_rows} rows every "
+        "compared system scored",
+        f"- B0 mean daily rank IC: {_fmt(information.mean_ic(information.baseline))}",
+    ]
+    for name in information.candidates:
+        if only is not None and name != only:
+            continue
+        estimate = information.gain(name)
+        if estimate is None:
+            lines.append(f"- {name}: not measurable")
+            continue
+        lines.append(
+            f"- {name}: mean daily rank IC {_fmt(information.mean_ic(name))}; gain over B0 "
+            f"{_fmt(estimate.point)}, {estimate.confidence:.0%} interval "
+            f"[{_fmt(estimate.lower)}, {_fmt(estimate.upper)}]; without the best date "
+            f"{_fmt(information.gain_excluding_best_date(name))}"
+        )
+    lines.extend(
+        [
+            "- A research claim about ranking skill, not a trading claim: trading still "
+            "needs every promotion gate.",
+            "",
+        ]
+    )
+    return lines
 
 
 def _fmt(value: object) -> str:

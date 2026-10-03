@@ -1,6 +1,6 @@
 # Status
 
-**As of 30 September 2026. Design version `chronos2_hourly_v1`, status
+**As of 3 October 2026. Design version `chronos2_hourly_v2`, status
 `design_only_unvalidated`.**
 
 ## What exists
@@ -11,7 +11,7 @@ pipeline, including the orchestration for build-order steps 4–6. Steps 1, 2 (l
 
 - All twelve section-16 integrity invariants pass on controlled fixtures
   ([INVARIANTS.md](INVARIANTS.md)).
-- 105 tests pass offline: no network, no checkpoint, no market data. 32 of them are
+- 110 tests pass offline: no network, no checkpoint, no market data. 33 of them are
   system-level tests that go through the pipeline rather than calling components
   directly, and each was mutation-checked against the defect it guards.
 - The collector's ledger reaches the pipeline through a session- and vintage-bounded
@@ -49,11 +49,20 @@ This is the important half of the status.
 ## What the registered design can and cannot show
 
 A positive control and a power analysis ([ANALYSIS.md](ANALYSIS.md)) found that the
-pipeline detects a large planted edge end to end, but that under the registered rules a
-realistic edge produces no alerts and cannot be confirmed by a 60-origin test. The
-expected outcome on real data is therefore "no edge demonstrated" whether or not an
-edge exists. ANALYSIS.md lists the options; each changes the protocol and must be
-decided before any real outcome is examined.
+pipeline detects a large planted edge end to end, but that under the rules registered
+as `chronos2_hourly_v1` a realistic edge produces no alerts and cannot be confirmed by
+a 60-origin test: the expected outcome on real data was "no edge demonstrated" whether
+or not an edge exists.
+
+On 3 October 2026, before any real outcome was examined, the protocol was amended
+([AMENDMENTS.md](AMENDMENTS.md)). Whether Chronos-2 adds information beyond B0 is now
+decided by the paired date-block bootstrap of the daily rank-IC gain over B0, on the
+rows every compared system scored — in development selection at 90% and in the final
+test at 95%. With
+50 names that test finds a mean IC gain of about 0.04 roughly two times in three. The
+alert rule, the portfolio and all eight gates are unchanged, so a *trading* claim is as
+hard to reach as before; what changed is that the *research* question has a test that
+can answer it.
 
 ## Unverified against the real checkpoint
 

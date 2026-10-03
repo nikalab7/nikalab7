@@ -80,9 +80,12 @@ record no winner.
   same dates. The paired bootstrap resamples identical date blocks for every system
   and reports each candidate against B0, against momentum, against its own
   exposure-matched benchmark and against every other candidate.
-  `operations.select_candidate` applies the section-12 rule, including its floors of
-  40 trades across 25 sessions, and records *no winner* — retaining C256 without
-  declaring it superior — whenever the evidence does not separate the leader. The
+  `operations.select_candidate` applies the section-12 rule as amended in
+  `chronos2_hourly_v2`: candidates are ranked by the paired rank-IC gain over B0 from
+  `evaluation.information_test`, on the rows every system scored, and the rule records
+  *no winner* — retaining C256 without declaring it superior — whenever the evidence
+  does not separate the leader. The trading floors of 40 trades across 25 sessions are
+  reported beside the selection and no longer decide it. The
   out-of-sample predictive report (Brier against each model's own training base rate,
   reliability, p10–p90 coverage, terminal pinball against a trailing-volatility
   reference, median error against persistence, and cross-sectional rank IC) now feeds
@@ -99,7 +102,8 @@ schedule and costs.
   block, and builds the 20-session prequential refit points from the schedule alone.
   `operations.run_final_test` replays exactly those refit points — each one fitted
   from history that had matured by its deadline — under a deliberately unlocked
-  guard, for the candidate and B0 alike.
+  guard, for the candidate and B0 alike. Its report leads with the primary
+  information test at 95%, beside the eight gates rather than inside them.
 - **Outstanding:** the single pass. A failed test cannot be relabelled development
   and reused. Nothing yet stops a second pass *across processes*: the guard's
   unlock is one-way within a process only, and "once" is still a discipline rather

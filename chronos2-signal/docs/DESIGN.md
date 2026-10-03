@@ -2,6 +2,10 @@
 
 **Prepared for Nika · 27 September 2026, Asia/Tbilisi · Version 1.0**
 
+**Amended 3 October 2026 as `chronos2_hourly_v2`:** the development selection rule of
+section 12 and the primary information test of section 14. Both changes are marked in
+place; the original text and the reason are in [AMENDMENTS.md](AMENDMENTS.md).
+
 **Status: registered protocol.** No market dataset was downloaded, no model weights
 loaded, no forecasting or backtest run, and no notification schedule activated for
 this document. Official documentation, source code and research were inspected. All
@@ -483,13 +487,21 @@ definitions and context simultaneously. Record every variant, including failures
 Selection after many trials inflates apparent performance; statistical correction and
 a fresh test are both needed [S13].
 
-Development selection: require at least 40 executed development-validation trades
-across 25 distinct signal sessions, positive base/stress net returns, and no
-dependence on one lucky outlier. Rank eligible Chronos candidates by the 90%
-date-block-bootstrap lower bound of mean daily reference-portfolio net return. If
-differences are inconclusive, retain C256 for continued research, without declaring
-it superior. A candidate must also show useful incremental evidence over B0; if not,
-do not claim a Transformer edge.
+Development selection *(amended in `chronos2_hourly_v2`, 3 October 2026)*: whether a
+Chronos candidate adds information beyond B0 is answered by the primary information
+test of section 14, not by the three-position reference portfolio, which cannot answer
+it at these sample sizes. A Chronos candidate
+is eligible with at least 25 development-validation dates carrying at least three rows
+that every compared system scored, a positive mean daily rank-IC gain over B0, and a
+gain that survives removing its single most favourable date. Rank eligible candidates
+by the 90% paired date-block-bootstrap lower bound of that gain. If the leader's gain
+over the runner-up is inconclusive at 90%, retain C256 for continued research, without
+declaring it superior. Claim development evidence of added information only when the
+selected candidate's lower bound against B0 is above zero and the frozen checkpoint
+produced its forecasts; otherwise do not claim a Transformer edge. The trading floors —
+at least 40 executed development-validation trades across 25 distinct signal sessions,
+positive base/stress net returns, and no dependence on one lucky outlier — are still
+computed and reported for every candidate; they no longer select.
 
 LightGBM and fine-tuning are outside these five variants. Their later admission
 requires a new registered version, additional untouched evaluation data and an
@@ -572,6 +584,23 @@ block length 10 sessions, with 5/20-session sensitivity. Resample the same date 
 across stocks and competing systems, preserving contemporaneous dependence. Report
 statistical uncertainty and the short-sample limitation; a bootstrap does not create
 missing regimes.
+
+Primary information test *(added in `chronos2_hourly_v2`, 3 October 2026)*. Whether
+Chronos-2 adds information beyond B0 is decided by the daily cross-sectional rank IC:
+on each date, the Spearman correlation between the registered ranking score (estimated
+net return over `sigma_2d`) and the realised base-cost net return, computed only on the
+rows that every compared system scored — the candidate and B0 in the final test, B0 and
+every candidate in development. A date with fewer than three such rows is dropped for
+all of them, so the series share one date index. The statistic is the candidate's mean
+daily IC minus B0's; its interval comes from the same moving-block bootstrap — 2,000
+samples, block length 10 sessions — resampling identical dates for every system.
+Development uses 90% (section 12); the final historical test uses 95%, on the
+reserved origins, once. Information is demonstrated when the lower bound is above zero
+and the frozen checkpoint produced the candidate's forecasts. This is a claim about
+ranking information, not about trading: it leaves the alert policy, the portfolio and
+all eight promotion requirements below unchanged, and it is not Transformer-specific
+alpha, which still needs requirement 4's incremental portfolio evidence. Information
+demonstrated with failed gates is reported as exactly that.
 
 Predeclared promotion requirements:
 

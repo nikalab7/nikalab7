@@ -44,13 +44,18 @@ from chronos2_signal.decision import (
 from chronos2_signal.evaluation import (
     BootstrapEstimate,
     DailySeries,
+    InformationTest,
+    LabelledPrediction,
     TradeRecord,
     block_profitability,
     brier_score,
+    common_rank_ic_series,
     contributor_concentration,
     evaluate_promotion_gates,
+    information_test,
     interval_coverage,
     moving_block_bootstrap,
+    paired_block_bootstrap,
     pinball_loss,
     reliability_table,
     spearman_correlation,
@@ -99,7 +104,9 @@ ORIGIN = dt.date(2025, 11, 25)
 
 
 def test_config_matches_the_registered_document(config):
-    assert config.design_version == "chronos2_hourly_v1"
+    from chronos2_signal import DESIGN_VERSION
+
+    assert config.design_version == "chronos2_hourly_v2" == DESIGN_VERSION
     assert config.status == "design_only_unvalidated"
     assert not config.is_validated
     assert config.model.id == "amazon/chronos-2"
@@ -114,6 +121,15 @@ def test_config_matches_the_registered_document(config):
     assert config.portfolio.max_open_positions == 3
     assert config.validation.earliest_primary_origin == dt.date(2025, 10, 31)
     assert config.validation.final_historical_test_origin_sessions == 60
+    # Amendment v2: the primary information criterion and its floors.
+    assert config.validation.information_criterion == "daily_rank_ic_candidate_minus_b0"
+    assert config.validation.information_min_common_rows_per_date == 3
+    assert config.validation.development_min_information_dates == 25
+    # ... while every trading floor and threshold stays as registered.
+    assert config.validation.development_min_executed_trades == 40
+    assert config.validation.development_min_signal_sessions == 25
+    assert config.validation.development_selection_bootstrap_confidence == 0.90
+    assert config.validation.promotion_bootstrap_confidence == 0.95
     assert config.events.version1_mode == "annotations_only"
     assert len(config.fingerprint()) == 64
 
@@ -147,6 +163,21 @@ def test_config_rejects_protocol_drift(tmp_path):
             ("initial_learned_variants: [B0, C128, C256, C512, U256]",
              "initial_learned_variants: [B0, C256, LGBM]"),
             "registered variants",
+        ),
+        # Amendment v2: the primary criterion cannot be swapped by editing the
+        # file, and the configuration must be the version the code implements.
+        (
+            ("information_criterion: daily_rank_ic_candidate_minus_b0",
+             "information_criterion: portfolio_return_minus_b0"),
+            "information_criterion",
+        ),
+        (
+            ("information_min_common_rows_per_date: 3", "information_min_common_rows_per_date: 2"),
+            "three rows",
+        ),
+        (
+            ("design_version: chronos2_hourly_v2", "design_version: chronos2_hourly_v1"),
+            "implements 'chronos2_hourly_v2'",
         ),
     ):
         with pytest.raises(ConfigError) as excinfo:
@@ -1140,6 +1171,52 @@ def test_block_bootstrap_preserves_block_structure():
     assert not wide.excludes_zero_above
 
 
+def test_a_series_shorter_than_two_blocks_gets_no_interval():
+    """One block cannot be resampled: every replicate would be the series itself.
+
+    The interval then collapsed onto the point estimate, so any positive mean
+    read as a certain one -- a stub with no information was 'demonstrated' on a
+    ten-date test. Below two full blocks there is now no interval at all.
+    """
+    rng = np.random.default_rng(5)
+
+    def series(name, returns):
+        sessions = tuple(dt.date(2025, 1, 6) + dt.timedelta(days=i) for i in range(len(returns)))
+        return DailySeries(name=name, sessions=sessions, returns=np.asarray(returns, dtype=float))
+
+    for n in (10, 19):
+        gains = series("C256", rng.normal(0.002, 0.01, n))
+        estimate = moving_block_bootstrap(gains, block_sessions=10, samples=200, confidence=0.95)
+        assert estimate.point == pytest.approx(gains.mean)
+        assert math.isnan(estimate.lower) and math.isnan(estimate.upper)
+        assert not estimate.excludes_zero_above
+        paired = paired_block_bootstrap(
+            [gains, series("B0", np.zeros(n))], block_sessions=10, samples=200,
+            confidence=0.95, differences=[("C256", "B0")],
+        )
+        assert math.isnan(paired["C256_minus_B0"].lower)
+        assert not paired["C256_minus_B0"].excludes_zero_above
+    # Two full blocks are enough to resample.
+    enough = moving_block_bootstrap(
+        series("C256", rng.normal(0.002, 0.01, 20)), block_sessions=10, samples=200,
+        confidence=0.95,
+    )
+    assert enough.lower < enough.upper
+
+    # The information test inherits this: a candidate better on all ten dates
+    # is not thereby shown to be better.
+    days = [dt.date(2025, 2, 3) + dt.timedelta(days=i) for i in range(10)]
+    outcomes = {"A": 1.0, "B": 2.0, "C": 3.0, "D": 4.0}
+    b0 = [_scored(day, s, 5.0 - o, o) for day in days for s, o in outcomes.items()]
+    cand = [_scored(day, s, o, o) for day in days for s, o in outcomes.items()]
+    short = information_test(
+        {"B0": b0, "C256": cand}, baseline="B0", min_rows=3, block_sessions=10,
+        samples=200, confidence=0.95,
+    )
+    assert short.dates == 10 and short.gain("C256").point == pytest.approx(2.0)
+    assert not short.demonstrated("C256")
+
+
 def test_trade_metrics_report_origins_without_trades():
     trades = [
         TradeRecord(dt.date(2025, 1, 6), "AAA", "I-AAA", "alpha", 0.02, 0.015, 0.01),
@@ -1214,6 +1291,63 @@ def _trade(day, issuer, sector, r_net, *, resolved=True):
     )
 
 
+def _scored(day, symbol, score, outcome):
+    return LabelledPrediction(
+        origin_session=day, symbol=symbol, calibrated_probability=0.5,
+        estimated_net_return=score * 0.02, sigma_2d=0.02, base_rate=0.5, r_net=outcome,
+    )
+
+
+def test_rank_ic_uses_only_rows_every_system_scored():
+    """A difference in IC must compare ranking skill on identical rows."""
+    first, second = dt.date(2025, 3, 3), dt.date(2025, 3, 4)
+    outcomes = {"A": 0.01, "B": 0.02, "C": -0.01, "D": 0.00, "E": 0.03}
+    b0 = [_scored(first, s, v, outcomes[s]) for s, v in zip("ABCDE", (1, 2, 3, 4, 5), strict=True)]
+    cand = [_scored(first, s, v, outcomes[s]) for s, v in zip("ABCDE", (2, 4, 1, 3, 5), strict=True)]
+    # A row only the candidate scored never enters, and neither does a date with
+    # fewer common rows than the minimum.
+    cand.append(_scored(first, "Z", 9.0, -0.5))
+    b0 += [_scored(second, s, 1.0 + i, 0.01 * i) for i, s in enumerate("AB")]
+    cand += [_scored(second, s, 1.0 + i, 0.01 * i) for i, s in enumerate("AB")]
+    series = common_rank_ic_series({"B0": b0, "C256": cand}, min_rows=3)
+    assert series["B0"].sessions == series["C256"].sessions == (first,)
+    order = sorted(outcomes)
+    assert series["C256"].returns[0] == pytest.approx(
+        spearman_correlation([2, 4, 1, 3, 5], [outcomes[s] for s in order])
+    )
+    assert series["B0"].returns[0] == pytest.approx(
+        spearman_correlation([1, 2, 3, 4, 5], [outcomes[s] for s in order])
+    )
+
+
+def test_information_test_finds_a_real_gain_and_not_a_lucky_date():
+    rng = np.random.default_rng(3)
+    days = [dt.date(2025, 1, 1) + dt.timedelta(days=i) for i in range(40)]
+    names = [f"S{i}" for i in range(30)]
+    b0, skilled, lucky = [], [], []
+    for index, day in enumerate(days):
+        outcome = rng.normal(size=len(names))
+        noise = rng.normal(size=len(names))
+        for i, name in enumerate(names):
+            b0.append(_scored(day, name, float(noise[i]), float(outcome[i])))
+            skilled.append(_scored(day, name, float(outcome[i] + 2.0 * rng.normal()), float(outcome[i])))
+            # Uninformative except on one date, where it is perfect.
+            score = float(outcome[i]) if index == 7 else float(noise[i])
+            lucky.append(_scored(day, name, score, float(outcome[i])))
+    test = information_test(
+        {"B0": b0, "C256": skilled, "C512": lucky}, baseline="B0", min_rows=3,
+        block_sessions=10, samples=400, confidence=0.90,
+    )
+    assert test.dates == 40 and test.candidates == ("C256", "C512")
+    assert test.demonstrated("C256")
+    assert test.gain("C256").point == pytest.approx(test.mean_ic("C256") - test.mean_ic("B0"))
+    assert test.gain_excluding_best_date("C256") > 0.0
+    # One perfect date makes the mean look positive; without it nothing is left.
+    assert test.gain("C512").point > 0.0
+    assert test.gain_excluding_best_date("C512") == pytest.approx(0.0, abs=1e-12)
+    assert "C256_minus_C512" in test.bootstrap
+
+
 def test_gate_five_counts_only_full_twenty_session_blocks(config):
     """A two-session tail is not one of the 'three separate 20-session blocks'."""
     returns = [0.001] * 20 + [0.001] * 20 + [-0.001] * 20 + [0.001] * 2
@@ -1245,39 +1379,131 @@ def test_gate_six_restricts_a_claim_explained_by_one_sector(config):
     assert not _gate(config, 6, returns=[0.0] * 20, trades=losing).passed
 
 
-def test_selection_follows_the_registered_rule(config):
-    """Section 12: rank by the 90% lower bound; keep C256 only if differences are inconclusive."""
+def _information(gains, lowers, *, dates=30):
+    """An information test with chosen daily IC gains over B0 and chosen lower bounds."""
+    sessions = tuple(dt.date(2025, 1, 1) + dt.timedelta(days=i) for i in range(dates))
+    base = np.full(dates, 0.02)
+    series = {"B0": DailySeries(name="B0", sessions=sessions, returns=base)}
+    for name, daily in gains.items():
+        returns = base + np.broadcast_to(np.asarray(daily, dtype=float), (dates,))
+        series[name] = DailySeries(name=name, sessions=sessions, returns=returns)
 
-    @dataclasses.dataclass
-    class _System:
-        trades: tuple
-        origins_scanned: int = 40
-
-    floors_met = tuple(_trade(1 + i % 28, f"S{i}", f"s{i % 4}", 0.005) for i in range(45))
-    systems = {name: _System(trades=floors_met) for name in ("B0", "C256", "C512")}
-
-    def estimate(name, lower):
+    def estimate(key):
+        first, second = key.split("_minus_")
+        point = float((series[first].returns - series[second].returns).mean())
         return BootstrapEstimate(
-            name=name, point=lower + 0.0002, lower=lower, upper=lower + 0.0004,
-            confidence=0.90, block_sessions=10, samples=100, n_sessions=40,
+            name=key, point=point, lower=lowers[key], upper=point + 0.01,
+            confidence=0.90, block_sessions=10, samples=100, n_sessions=dates,
         )
 
-    bootstrap = {
-        "C512": estimate("C512", -0.00005),
-        "C256": estimate("C256", -0.00020),
-        "C512_minus_C256": estimate("C512_minus_C256", 0.00010),
-        "C512_minus_B0": estimate("C512_minus_B0", -0.00010),
-    }
-    decision = select_candidate(config=config, systems=systems, bootstrap=bootstrap)
-    # C512 leads and its difference from the runner-up is conclusive. Section 12
-    # sets no further condition on the leader's own lower bound.
-    assert decision.selected == "C512"
-    assert decision.transformer_edge_claimable is False  # it does not beat B0
+    return InformationTest(
+        baseline="B0", candidates=tuple(gains), series=series,
+        bootstrap={key: estimate(key) for key in lowers}, confidence=0.90, min_rows=3,
+    )
 
-    bootstrap["C512_minus_C256"] = estimate("C512_minus_C256", -0.00001)
-    inconclusive = select_candidate(config=config, systems=systems, bootstrap=bootstrap)
+
+@dataclasses.dataclass
+class _System:
+    """The parts of a development run the selection rule reads."""
+
+    trades: tuple = ()
+    origins_scanned: int = 40
+    forecaster_provenance: dict = dataclasses.field(
+        default_factory=lambda: {"forecaster": "chronos2", "is_frozen_checkpoint": True}
+    )
+
+
+def test_selection_follows_the_registered_rule(config):
+    """Amended section 12: the paired rank-IC gain over B0 selects, not the portfolio."""
+    # No candidate traded at all: every trading floor fails, and none of that
+    # matters to the selection any more -- it is reported beside it.
+    systems = {name: _System() for name in ("B0", "C256", "C512")}
+
+    # The ranking reads the lower bound, not the point: C512 has the larger mean
+    # gain but the less certain one.
+    lowers = {"C256_minus_B0": 0.010, "C512_minus_B0": 0.004, "C256_minus_C512": 0.001}
+    decision = select_candidate(
+        config=config, information=_information({"C256": 0.03, "C512": 0.04}, lowers),
+        systems=systems,
+    )
+    assert [name for name, _ in decision.ranking] == ["C256", "C512"]
+    assert decision.ranking[0][1] == pytest.approx(0.010)
+    assert decision.selected == "C256"
+    assert decision.transformer_edge_claimable is True
+    assert decision.eligibility == {"C256": (), "C512": ()}
+    assert all(decision.trading_floors[name] for name in ("C256", "C512"))
+    assert "0 executed trades" in decision.trading_floors["C256"][0]
+
+    # The same numbers from a fixture forecaster select the same candidate, and
+    # claim nothing: they are plumbing, whatever they show.
+    fixture = {**systems, "C256": _System(forecaster_provenance={"is_frozen_checkpoint": False})}
+    plumbing = select_candidate(
+        config=config, information=_information({"C256": 0.03, "C512": 0.04}, lowers),
+        systems=fixture,
+    )
+    assert plumbing.selected == "C256"
+    assert plumbing.transformer_edge_claimable is False
+    assert "nothing is claimed for Chronos-2" in plumbing.statement
+
+    # A conclusive leader whose own gain is not separated from zero is selected,
+    # but nothing Chronos-specific is claimed for it.
+    lowers = {"C256_minus_B0": -0.002, "C512_minus_B0": -0.008, "C256_minus_C512": 0.001}
+    unproven = select_candidate(
+        config=config, information=_information({"C256": 0.03, "C512": 0.02}, lowers),
+        systems=systems,
+    )
+    assert unproven.selected == "C256"
+    assert unproven.transformer_edge_claimable is False
+    assert "no Chronos-specific information is claimed" in unproven.statement
+
+    # Leader and runner-up indistinguishable: no winner, C256 kept for research
+    # without being declared superior -- even when the leader is C512.
+    lowers = {"C256_minus_B0": 0.004, "C512_minus_B0": 0.010, "C512_minus_C256": -0.001}
+    inconclusive = select_candidate(
+        config=config, information=_information({"C256": 0.03, "C512": 0.04}, lowers),
+        systems=systems,
+    )
+    assert [name for name, _ in inconclusive.ranking] == ["C512", "C256"]
     assert inconclusive.selected is None
     assert inconclusive.retained_for_research == "C256"
+    assert inconclusive.transformer_edge_claimable is False
+    assert "without being declared superior" in inconclusive.statement
+
+
+def test_selection_floors_for_the_information_criterion(config):
+    """Enough dates, a positive gain, and a gain that is not one lucky date."""
+    systems = {name: _System() for name in ("B0", "C128", "C256", "C512")}
+    lucky = np.zeros(30)
+    lucky[11] = 0.9  # mean gain 0.03, all of it on one date
+    lowers = {
+        "C256_minus_B0": 0.01, "C512_minus_B0": 0.01, "C128_minus_B0": 0.01,
+        "C256_minus_C512": 0.01, "C256_minus_C128": 0.01,
+    }
+    decision = select_candidate(
+        config=config,
+        information=_information({"C256": 0.03, "C512": lucky, "C128": -0.01}, lowers),
+        systems=systems,
+    )
+    assert decision.eligibility["C256"] == ()
+    assert decision.eligibility["C512"] == ("the gain does not survive removing the single best date",)
+    assert decision.eligibility["C128"] == (
+        "mean daily rank-IC gain over B0 is not positive",
+        "the gain does not survive removing the single best date",
+    )
+    # With one eligible candidate there is no runner-up to separate it from.
+    assert decision.selected == "C256" and decision.transformer_edge_claimable
+
+    # Too few dates with common rows: nothing is eligible, whatever the gains.
+    short = select_candidate(
+        config=config,
+        information=_information({"C256": 0.03}, {"C256_minus_B0": 0.01}, dates=24),
+        systems=systems,
+    )
+    assert short.selected is None and short.retained_for_research == "C256"
+    assert short.eligibility["C256"] == (
+        "24 development dates with 3+ common rows, fewer than 25",
+    )
+    assert "No Chronos candidate met the information criterion's floors" in short.statement
 
 
 def test_promotion_gates_fail_closed(config):

@@ -7,7 +7,7 @@
 # Values remain unchanged until a registered protocol amendment. Any change
 # must bump `design_version` and be recorded in docs/AMENDMENTS.md.
 
-design_version: chronos2_hourly_v1
+design_version: chronos2_hourly_v2
 status: design_only_unvalidated
 
 data:
@@ -116,9 +116,17 @@ validation:
   forward_min_executed_signals: 50
   combined_evaluation_min_executed_signals: 100
   combined_evaluation_min_signal_sessions: 60
-  # Development selection floors (section 12).
+  # Trading floors (section 12). Reported for every candidate; since
+  # chronos2_hourly_v2 they no longer select.
   development_min_executed_trades: 40
   development_min_signal_sessions: 25
+  # Primary information criterion (sections 12 and 14, amended in
+  # chronos2_hourly_v2): daily cross-sectional rank IC of the registered ranking
+  # score against the realised base-cost net return, candidate minus B0, on the
+  # rows every compared system scored; paired date-block bootstrap.
+  information_criterion: daily_rank_ic_candidate_minus_b0
+  information_min_common_rows_per_date: 3
+  development_min_information_dates: 25
   development_selection_bootstrap_confidence: 0.90
   promotion_bootstrap_confidence: 0.95
   promotion_min_profitable_blocks: 3

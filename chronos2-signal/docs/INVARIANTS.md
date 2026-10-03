@@ -53,6 +53,9 @@ The tests verify behaviour; these are the places that make it true.
 | Commit before notify | `operations.run_after_close` (one transaction per origin), `notifier.Notifier.notify_session` |
 | One scoring path | `simulation.score_origin`, used by the backtest and by `operations.run_after_close` |
 | Identical accounting for controls | every system runs through `simulation.simulate`; `evaluation.paired_block_bootstrap` refuses mismatched date indices |
+| Information measured on identical rows (v2) | `evaluation.common_rank_ic_series` — only symbols every compared system scored, on dates all of them share; `evaluation.information_test` resamples one set of date blocks for all |
+| No claim from a fixture forecaster (v2) | `operations._from_checkpoint`, read by `operations.select_candidate` and `operations.StudyResult.information_demonstrated` |
+| Code and configuration implement one protocol | `config.load_design` refuses a `design_version` other than `DESIGN_VERSION` and any information criterion other than the registered one |
 | Output label fails closed | `config.DesignConfig.is_validated` (allowlist), `policy.PolicyEngine.output_label` |
 
 ## Components that were correct but not wired in
@@ -167,7 +170,10 @@ accepted. Each fix has a test that failed before it.
     concentrated". (`test_gate_six_restricts_a_claim_explained_by_one_sector`)
 18. **The selection rule had a condition section 12 does not contain** — a positive
     lower bound for the leader — so a candidate conclusively better than C256 could
-    still be passed over. (`test_selection_follows_the_registered_rule`)
+    still be passed over. (`test_selection_follows_the_registered_rule`; since
+    `chronos2_hourly_v2` the rule ranks rank-IC gains over B0, and the test still
+    checks that a conclusive leader without a positive bound of its own is selected
+    but claims nothing.)
 19. **The momentum control ignored the correlation cap**, one of "the same capacity
     rules". Both systems now use one function.
     (`test_momentum_control_respects_the_same_capacity_rules`)
@@ -190,3 +196,15 @@ Latent — unreachable by any current caller, fixed so they cannot become live:
     (`test_a_stress_cost_run_still_records_each_trade_at_every_cost_level`)
 26. "Alert coverage" counted executed trades; alerts now come from the selector's
     own record.
+
+Found while building the positive control for amendment `chronos2_hourly_v2`, 3 October
+2026:
+
+27. **A series of one bootstrap block produced a zero-width interval.** With ten dates
+    and ten-session blocks every replicate is the series itself, so the interval was
+    the point estimate and any positive mean read as certain. The stub forecaster, which
+    has no information, was "demonstrated" to add information on the ten-date test of a
+    small fixture schedule. Fewer than two full blocks now give no interval. The
+    registered sizes were never affected; a short sample would have been.
+    (`test_a_series_shorter_than_two_blocks_gets_no_interval`,
+    `test_final_test_replays_the_registered_refit_schedule`)

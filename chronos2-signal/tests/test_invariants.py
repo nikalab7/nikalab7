@@ -778,13 +778,13 @@ def test_invariant_10_duplicate_runs_and_failed_data(tmp_path, config, calendar)
     """One persisted signal and one notification per deduplication key."""
     ledger = Ledger(tmp_path / "ledger.sqlite")
     now = dt.datetime(2025, 11, 25, 21, 30, tzinfo=dt.timezone.utc)
-    key = Ledger.dedup_key("chronos2_hourly_v1", "ISSUER-AAA", ORIGIN, "2_sessions")
+    key = Ledger.dedup_key(config.design_version, "ISSUER-AAA", ORIGIN, "2_sessions")
 
     def write(signal_id: str) -> str:
         return ledger.record_signal(
             signal_id=signal_id,
             dedup_key=key,
-            strategy_version="chronos2_hourly_v1",
+            strategy_version=config.design_version,
             issuer_id="ISSUER-AAA",
             symbol="AAA",
             sector="alpha",
